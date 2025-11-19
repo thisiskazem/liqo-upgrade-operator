@@ -38,17 +38,16 @@ type LiqoUpgradeSpec struct {
 type UpgradePhase string
 
 const (
-	PhaseNone               UpgradePhase = ""
-	PhasePending            UpgradePhase = "Pending"
-	PhaseValidating         UpgradePhase = "Validating"
-	PhaseFreezingOperations UpgradePhase = "FreezingOperations"
-	PhaseCRDs               UpgradePhase = "UpgradingCRDs"
-	PhaseControllerManager  UpgradePhase = "UpgradingControllerManager"
-	PhaseNetworkFabric      UpgradePhase = "UpgradingNetworkFabric"
-	PhaseVerifying          UpgradePhase = "Verifying"
-	PhaseRollingBack        UpgradePhase = "RollingBack"
-	PhaseCompleted          UpgradePhase = "Completed"
-	PhaseFailed             UpgradePhase = "Failed"
+	PhaseNone              UpgradePhase = ""
+	PhasePending           UpgradePhase = "Pending"
+	PhaseValidating        UpgradePhase = "Validating"
+	PhaseCRDs              UpgradePhase = "UpgradingCRDs"
+	PhaseControllerManager UpgradePhase = "UpgradingControllerManager"
+	PhaseNetworkFabric     UpgradePhase = "UpgradingNetworkFabric"
+	PhaseVerifying         UpgradePhase = "Verifying"
+	PhaseRollingBack       UpgradePhase = "RollingBack"
+	PhaseCompleted         UpgradePhase = "Completed"
+	PhaseFailed            UpgradePhase = "Failed"
 )
 
 type ConditionType string
@@ -57,6 +56,7 @@ const (
 	ConditionCompatible       ConditionType = "Compatible"
 	ConditionHealthy          ConditionType = "Healthy"
 	ConditionRollbackRequired ConditionType = "RollbackRequired"
+	ConditionCRDWarnings      ConditionType = "CRDWarnings"
 )
 
 type LiqoUpgradeStatus struct {
@@ -64,8 +64,9 @@ type LiqoUpgradeStatus struct {
 	Message             string             `json:"message,omitempty"`
 	LastUpdated         metav1.Time        `json:"lastUpdated,omitempty"`
 	PreviousVersion     string             `json:"previousVersion,omitempty"`
-	BackupName          string             `json:"backupName,omitempty"`
-	BackupReady         bool               `json:"backupReady,omitempty"`
+	SnapshotConfigMap   string             `json:"snapshotConfigMap,omitempty"`
+	PlanConfigMap       string             `json:"planConfigMap,omitempty"`
+	PlanReady           bool               `json:"planReady,omitempty"`
 	LastSuccessfulPhase UpgradePhase       `json:"lastSuccessfulPhase,omitempty"`
 	CurrentStage        int                `json:"currentStage,omitempty"`
 	TotalStages         int                `json:"totalStages,omitempty"`

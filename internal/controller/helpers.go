@@ -51,12 +51,13 @@ func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgra
 		if conditions, ok := additionalUpdates["conditions"].([]metav1.Condition); ok {
 			upgrade.Status.Conditions = conditions
 		}
-		if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
-			upgrade.Status.BackupReady = backupReady
-		}
-		if backupName, ok := additionalUpdates["backupName"].(string); ok {
-			upgrade.Status.BackupName = backupName
-		}
+		// Note: BackupReady and BackupName fields are planned for future implementation
+		// if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
+		// 	upgrade.Status.BackupReady = backupReady
+		// }
+		// if backupName, ok := additionalUpdates["backupName"].(string); ok {
+		// 	upgrade.Status.BackupName = backupName
+		// }
 	}
 
 	if err := r.Status().Update(ctx, upgrade); err != nil {
@@ -77,7 +78,7 @@ func (r *LiqoUpgradeReconciler) handleDeletion(ctx context.Context, upgrade *upg
 
 	if controllerutil.ContainsFinalizer(upgrade, finalizerName) {
 		// Clean up jobs
-		jobPrefixes := []string{freezeOperationsJobPrefix, crdUpgradeJobPrefix, controllerManagerUpgradePrefix, networkFabricUpgradePrefix, rollbackJobPrefix}
+		jobPrefixes := []string{crdUpgradeJobPrefix, controllerManagerUpgradePrefix, networkFabricUpgradePrefix, rollbackJobPrefix}
 		for _, prefix := range jobPrefixes {
 			jobName := fmt.Sprintf("%s-%s", prefix, upgrade.Name)
 			job := &batchv1.Job{}

@@ -39,21 +39,21 @@ type LiqoUpgradeReconciler struct {
 
 const (
 	finalizerName                  = "upgrade.liqo.io/finalizer"
-	freezeOperationsJobPrefix      = "liqo-freeze-operations"
 	crdUpgradeJobPrefix            = "liqo-upgrade-crd"
 	controllerManagerUpgradePrefix = "liqo-upgrade-controller-manager"
 	networkFabricUpgradePrefix     = "liqo-upgrade-network-fabric"
 	rollbackJobPrefix              = "liqo-rollback"
 	compatibilityConfigMap         = "liqo-version-compatibility"
+	targetDescriptorsConfigMap     = "liqo-target-descriptors"
 )
 
 // +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgrades,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgrades/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgrades/finalizers,verbs=update
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs;cronjobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts;configmaps;namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups=apps,resources=deployments;daemonsets,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core.liqo.io,resources=foreignclusters,verbs=get;list;watch
 
@@ -92,8 +92,6 @@ func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.startValidation(ctx, upgrade)
 	case upgradev1alpha1.PhaseValidating:
 		return r.performValidation(ctx, upgrade)
-	case upgradev1alpha1.PhaseFreezingOperations:
-		return r.monitorFreezeOperations(ctx, upgrade)
 	case upgradev1alpha1.PhaseCRDs:
 		return r.monitorCRDUpgrade(ctx, upgrade)
 	case upgradev1alpha1.PhaseControllerManager:

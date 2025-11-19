@@ -92,21 +92,54 @@ func (r *LiqoUpgradeReconciler) buildNetworkFabricUpgradeJob(upgrade *upgradev1a
 		namespace = "liqo"
 	}
 
-	backupConfigMapName := upgrade.Status.BackupName
-	if backupConfigMapName == "" {
-		backupConfigMapName = fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
+	// Generate backup ConfigMap name (BackupName field planned for future implementation)
+	backupConfigMapName := fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
+
+	planConfigMap := upgrade.Status.PlanConfigMap
+	if planConfigMap == "" {
+		planConfigMap = fmt.Sprintf("liqo-upgrade-plan-%s", upgrade.Name)
 	}
 
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
 
 echo "========================================="
-echo "Stage 3: Upgrading Network Fabric"
+echo "Stage 3: Upgrading Network & Data-Plane"
 echo "========================================="
+
+# Verify required dependencies
+echo "Verifying required tools..."
+if ! command -v jq &> /dev/null; then
+  echo "❌ ERROR: jq is required but not found"
+  exit 1
+fi
+if ! command -v kubectl &> /dev/null; then
+  echo "❌ ERROR: kubectl is required but not found"
+  exit 1
+fi
+if ! command -v curl &> /dev/null; then
+  echo "❌ ERROR: curl is required but not found"
+  exit 1
+fi
+echo "✓ All required tools are available"
+echo ""
 
 TARGET_VERSION="%s"
 NAMESPACE="%s"
 BACKUP_CONFIGMAP="%s"
+PLAN_CONFIGMAP="%s"
+
+# Load upgrade plan
+echo "Loading upgrade plan from ConfigMap ${PLAN_CONFIGMAP}..."
+PLAN_JSON=$(kubectl get configmap "${PLAN_CONFIGMAP}" -n "${NAMESPACE}" -o jsonpath='{.data.plan\.json}')
+
+if [ -z "$PLAN_JSON" ]; then
+  echo "⚠️  WARNING: Failed to load upgrade plan, will use fallback image upgrades"
+  PLAN_JSON='{}'
+fi
+
+echo "Upgrade plan loaded"
+echo ""
 
 echo "Step 1: Backing up network fabric deployments..."
 mkdir -p /tmp/network-backup
@@ -141,7 +174,37 @@ if kubectl get deployment liqo-proxy -n "${NAMESPACE}" &>/dev/null; then
 fi
 
 echo ""
-echo "Step 2: Upgrading Gateway Templates (MUST happen before gateway instance recreation)..."
+echo "Step 2: Validating WireGuard/Geneve Prerequisites..."
+
+# Check for WireGuard keys and configuration
+echo "Checking WireGuard keys and secrets..."
+WG_SECRETS=$(kubectl get secrets -n "${NAMESPACE}" -l "liqo.io/component=gateway" -o jsonpath='{.items[*].metadata.name}' || echo "")
+if [ -n "$WG_SECRETS" ]; then
+  echo "  Found gateway secrets:"
+  for secret in $WG_SECRETS; do
+    KEYS=$(kubectl get secret "$secret" -n "${NAMESPACE}" -o jsonpath='{.data}' | jq 'keys' 2>/dev/null || echo "[]")
+    echo "    - $secret: $KEYS"
+  done
+  echo "  ✓ Gateway secrets present"
+else
+  echo "  ⚠️  WARNING: No gateway secrets found with liqo.io/component=gateway label"
+fi
+
+# Check for gateway ConfigMaps
+echo "Checking gateway ConfigMaps..."
+WG_CONFIGMAPS=$(kubectl get configmaps -n "${NAMESPACE}" -l "liqo.io/component=gateway" -o jsonpath='{.items[*].metadata.name}' || echo "")
+if [ -n "$WG_CONFIGMAPS" ]; then
+  echo "  Found gateway ConfigMaps:"
+  for cm in $WG_CONFIGMAPS; do
+    echo "    - $cm"
+  done
+  echo "  ✓ Gateway ConfigMaps present"
+else
+  echo "  ℹ️  No gateway ConfigMaps found (may be optional)"
+fi
+
+echo ""
+echo "Step 3: Upgrading Gateway Templates (MUST happen before gateway instance recreation)..."
 
 # Upgrade WgGatewayClientTemplate
 echo "--- Upgrading WgGatewayClientTemplate ---"
@@ -198,7 +261,32 @@ fi
 echo "✅ Gateway templates upgraded successfully"
 
 echo ""
-echo "Step 3: Upgrading network components sequentially..."
+echo "Step 4: Upgrading network components sequentially with health checks..."
+
+# Function to check component health
+check_component_health() {
+  local COMPONENT=$1
+  local KIND=$2
+  local NAMESPACE=$3
+
+  echo "  Performing health check for ${COMPONENT}..."
+
+  if [ "$KIND" == "Deployment" ]; then
+    REPLICAS=$(kubectl get deployment "$COMPONENT" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+    DESIRED=$(kubectl get deployment "$COMPONENT" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+  elif [ "$KIND" == "DaemonSet" ]; then
+    REPLICAS=$(kubectl get daemonset "$COMPONENT" -n "$NAMESPACE" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+    DESIRED=$(kubectl get daemonset "$COMPONENT" -n "$NAMESPACE" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "1")
+  fi
+
+  if [ "$REPLICAS" == "$DESIRED" ] && [ "$REPLICAS" -gt 0 ]; then
+    echo "    ✓ ${COMPONENT} healthy: ${REPLICAS}/${DESIRED} ready"
+    return 0
+  else
+    echo "    ✗ ${COMPONENT} unhealthy: ${REPLICAS}/${DESIRED} ready"
+    return 1
+  fi
+}
 
 # Upgrade liqo-ipam first (less critical, manages IP allocation)
 if kubectl get deployment liqo-ipam -n "${NAMESPACE}" &>/dev/null; then
@@ -231,6 +319,12 @@ if kubectl get deployment liqo-ipam -n "${NAMESPACE}" &>/dev/null; then
   fi
 
   echo "✅ liqo-ipam upgraded successfully"
+
+  # Health check after ipam upgrade
+  check_component_health "liqo-ipam" "Deployment" "${NAMESPACE}" || {
+    echo "❌ ERROR: liqo-ipam health check failed!"
+    exit 1
+  }
 fi
 
 # Upgrade liqo-proxy (Deployment)
@@ -264,6 +358,12 @@ if kubectl get deployment liqo-proxy -n "${NAMESPACE}" &>/dev/null; then
   fi
 
   echo "✅ liqo-proxy upgraded successfully"
+
+  # Health check after proxy upgrade
+  check_component_health "liqo-proxy" "Deployment" "${NAMESPACE}" || {
+    echo "❌ ERROR: liqo-proxy health check failed!"
+    exit 1
+  }
 fi
 
 # Upgrade liqo-fabric (DaemonSet) - Data plane component
@@ -301,6 +401,120 @@ if kubectl get daemonset liqo-fabric -n "${NAMESPACE}" &>/dev/null; then
   fi
 
   echo "✅ liqo-fabric upgraded successfully (${READY}/${DESIRED} pods ready)"
+
+  # Health check after fabric upgrade
+  check_component_health "liqo-fabric" "DaemonSet" "${NAMESPACE}" || {
+    echo "❌ ERROR: liqo-fabric health check failed!"
+    exit 1
+  }
+
+  # Check routes are still present after fabric upgrade
+  echo "  Verifying network routes..."
+  ROUTE_COUNT=$(kubectl exec -n "${NAMESPACE}" daemonset/liqo-fabric -- ip route | wc -l 2>/dev/null || echo "0")
+  if [ "$ROUTE_COUNT" -gt 0 ]; then
+    echo "    ✓ Network routes present (${ROUTE_COUNT} routes)"
+  else
+    echo "    ⚠️  WARNING: Could not verify network routes"
+  fi
+fi
+
+# Upgrade virtual-kubelet components (if present)
+echo ""
+echo "--- Upgrading Virtual Kubelet Components ---"
+
+# Check if VK components exist
+VK_DAEMONSETS=$(kubectl get daemonsets -n "${NAMESPACE}" -l app.kubernetes.io/component=virtual-kubelet -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+VK_DEPLOYMENTS=$(kubectl get deployments -n "${NAMESPACE}" -l app.kubernetes.io/component=virtual-kubelet -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+if [ -z "$VK_DAEMONSETS" ] && [ -z "$VK_DEPLOYMENTS" ]; then
+  echo "  ℹ️  No Virtual Kubelet components found, skipping"
+else
+  echo "  Found Virtual Kubelet components:"
+  [ -n "$VK_DAEMONSETS" ] && echo "    DaemonSets: $VK_DAEMONSETS"
+  [ -n "$VK_DEPLOYMENTS" ] && echo "    Deployments: $VK_DEPLOYMENTS"
+
+  # Verify control-plane and CRDs are healthy before upgrading VK
+  echo "  Verifying control-plane health before VK upgrade..."
+  if ! kubectl wait --for=condition=available --timeout=30s deployment/liqo-controller-manager -n "${NAMESPACE}" 2>/dev/null; then
+    echo "  ⚠️  WARNING: controller-manager not ready, VK upgrade may fail"
+  else
+    echo "    ✓ Controller-manager healthy"
+  fi
+
+  # Check for offloading CR schema compatibility
+  echo "  Checking offloading CRD compatibility..."
+  OFFLOADING_CRD_VERSION=$(kubectl get crd namespacemaps.offloading.liqo.io -o jsonpath='{.spec.versions[?(@.storage==true)].name}' 2>/dev/null || echo "unknown")
+  echo "    Current NamespaceMap storage version: ${OFFLOADING_CRD_VERSION}"
+
+  # Upgrade VK DaemonSets
+  for VK_DS in $VK_DAEMONSETS; do
+    echo ""
+    echo "  Upgrading VK DaemonSet: ${VK_DS}"
+
+    NEW_IMAGE="ghcr.io/liqotech/virtual-kubelet:${TARGET_VERSION}"
+    CONTAINER_NAME=$(kubectl get daemonset "$VK_DS" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
+
+    kubectl set image daemonset/"$VK_DS" \
+      "${CONTAINER_NAME}=${NEW_IMAGE}" \
+      -n "${NAMESPACE}"
+
+    echo "    Waiting for rollout..."
+    if ! kubectl rollout status daemonset/"$VK_DS" -n "${NAMESPACE}" --timeout=5m; then
+      echo "    ❌ ERROR: VK DaemonSet ${VK_DS} rollout failed!"
+      exit 1
+    fi
+
+    check_component_health "$VK_DS" "DaemonSet" "${NAMESPACE}" || {
+      echo "    ❌ ERROR: VK DaemonSet ${VK_DS} health check failed!"
+      exit 1
+    }
+
+    echo "    ✅ ${VK_DS} upgraded successfully"
+  done
+
+  # Upgrade VK Deployments
+  for VK_DEP in $VK_DEPLOYMENTS; do
+    echo ""
+    echo "  Upgrading VK Deployment: ${VK_DEP}"
+
+    NEW_IMAGE="ghcr.io/liqotech/virtual-kubelet:${TARGET_VERSION}"
+    CONTAINER_NAME=$(kubectl get deployment "$VK_DEP" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
+
+    kubectl set image deployment/"$VK_DEP" \
+      "${CONTAINER_NAME}=${NEW_IMAGE}" \
+      -n "${NAMESPACE}"
+
+    echo "    Waiting for rollout..."
+    if ! kubectl rollout status deployment/"$VK_DEP" -n "${NAMESPACE}" --timeout=5m; then
+      echo "    ❌ ERROR: VK Deployment ${VK_DEP} rollout failed!"
+      exit 1
+    fi
+
+    check_component_health "$VK_DEP" "Deployment" "${NAMESPACE}" || {
+      echo "    ❌ ERROR: VK Deployment ${VK_DEP} health check failed!"
+      exit 1
+    }
+
+    echo "    ✅ ${VK_DEP} upgraded successfully"
+  done
+
+  echo ""
+  echo "  Verifying VK can reconcile offloaded resources..."
+  sleep 10  # Give VK time to start reconciling
+
+  # Check VK pod logs for errors
+  VK_POD=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/component=virtual-kubelet -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  if [ -n "$VK_POD" ]; then
+    ERROR_COUNT=$(kubectl logs "$VK_POD" -n "${NAMESPACE}" --tail=100 2>/dev/null | grep -i "error\|failed" | wc -l || echo "0")
+    if [ "$ERROR_COUNT" -gt 5 ]; then
+      echo "    ⚠️  WARNING: VK pod has ${ERROR_COUNT} recent errors in logs"
+    else
+      echo "    ✓ VK logs look healthy (${ERROR_COUNT} errors)"
+    fi
+  fi
+
+  echo ""
+  echo "✅ Virtual Kubelet components upgraded successfully"
 fi
 
 # Upgrade gateway deployments in tenant namespaces
@@ -454,7 +668,7 @@ else
 fi
 
 echo ""
-echo "Step 4: Final verification of network fabric..."
+echo "Step 5: Final verification of network & data-plane..."
 
 # Wait for pod updates to fully propagate
 echo "Waiting for pod updates to propagate..."
@@ -582,22 +796,91 @@ for TENANT_NS in ${TENANT_NAMESPACES}; do
 done
 
 echo ""
-echo "Step 4: Verifying network connectivity..."
-# Basic connectivity check - verify fabric pods can reach API server
+echo "Step 6: Comprehensive network connectivity verification..."
+
+# Check fabric pods can reach API server
+echo "  Checking fabric pods API connectivity..."
 FABRIC_PODS=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[*].metadata.name}')
 if [ -n "$FABRIC_PODS" ]; then
-  echo "✓ Fabric pods found and running"
+  FABRIC_POD=$(echo "$FABRIC_PODS" | awk '{print $1}')
+  if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- wget -q -O- --timeout=5 https://kubernetes.default.svc >/dev/null 2>&1; then
+    echo "    ✓ Fabric pod can reach Kubernetes API"
+  else
+    echo "    ⚠️  WARNING: Fabric pod cannot reach Kubernetes API"
+  fi
 else
-  echo "⚠️  Warning: No fabric pods found"
+  echo "    ⚠️  WARNING: No fabric pods found"
+fi
+
+# Check for active ForeignClusters and their connectivity
+echo "  Checking ForeignCluster connectivity..."
+FOREIGN_CLUSTERS=$(kubectl get foreignclusters -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+if [ -n "$FOREIGN_CLUSTERS" ]; then
+  FC_COUNT=$(echo "$FOREIGN_CLUSTERS" | wc -w)
+  echo "    Found ${FC_COUNT} ForeignCluster(s)"
+
+  for FC in $FOREIGN_CLUSTERS; do
+    FC_STATUS=$(kubectl get foreigncluster "$FC" -o jsonpath='{.status.peeringConditions[?(@.type=="NetworkStatus")].status}' 2>/dev/null || echo "Unknown")
+    echo "      - ${FC}: NetworkStatus=${FC_STATUS}"
+  done
+
+  # Count established connections
+  ESTABLISHED=$(kubectl get foreignclusters -o json 2>/dev/null | jq -r '.items[].status.peeringConditions[] | select(.type=="NetworkStatus" and .status=="True")' | wc -l || echo "0")
+  if [ "$ESTABLISHED" -gt 0 ]; then
+    echo "    ✓ ${ESTABLISHED} ForeignCluster(s) with network connectivity"
+  else
+    echo "    ⚠️  WARNING: No ForeignClusters with established network connectivity"
+  fi
+else
+  echo "    ℹ️  No ForeignClusters found (single-cluster setup)"
+fi
+
+# Verify tunnel interfaces exist (if fabric is running)
+if [ -n "$FABRIC_PODS" ]; then
+  echo "  Checking tunnel interfaces..."
+  FABRIC_POD=$(echo "$FABRIC_PODS" | awk '{print $1}')
+  TUNNEL_COUNT=$(kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- ip link show type geneve 2>/dev/null | grep -c "geneve" || echo "0")
+  if [ "$TUNNEL_COUNT" -gt 0 ]; then
+    echo "    ✓ Found ${TUNNEL_COUNT} tunnel interface(s)"
+  else
+    echo "    ℹ️  No tunnel interfaces found (may be normal if no peerings)"
+  fi
+fi
+
+# Check gateway pod connectivity in tenant namespaces
+echo "  Checking gateway pod connectivity..."
+GATEWAY_HEALTHY=0
+GATEWAY_UNHEALTHY=0
+
+for TENANT_NS in ${TENANT_NAMESPACES}; do
+  GATEWAY_PODS=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+  for GW_POD in $GATEWAY_PODS; do
+    POD_STATUS=$(kubectl get pod "$GW_POD" -n "${TENANT_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+    if [ "$POD_STATUS" == "Running" ]; then
+      GATEWAY_HEALTHY=$((GATEWAY_HEALTHY + 1))
+    else
+      GATEWAY_UNHEALTHY=$((GATEWAY_UNHEALTHY + 1))
+      echo "    ⚠️  Gateway pod ${GW_POD} in ${TENANT_NS}: ${POD_STATUS}"
+    fi
+  done
+done
+
+if [ $GATEWAY_HEALTHY -gt 0 ]; then
+  echo "    ✓ ${GATEWAY_HEALTHY} gateway pod(s) running"
+fi
+
+if [ $GATEWAY_UNHEALTHY -gt 0 ]; then
+  echo "    ⚠️  WARNING: ${GATEWAY_UNHEALTHY} gateway pod(s) not running"
 fi
 
 echo ""
 echo "========================================="
-echo "✅ Stage 3 complete: Network Fabric upgraded"
+echo "✅ Stage 3 complete: Network & Data-Plane upgraded"
 echo "✅ All network components upgraded to ${TARGET_VERSION}"
 echo "✅ All critical environment variables and args preserved"
 echo "========================================="
-`, upgrade.Spec.TargetVersion, namespace, backupConfigMapName)
+`, upgrade.Spec.TargetVersion, namespace, backupConfigMapName, planConfigMap)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -617,7 +900,7 @@ echo "========================================="
 					Containers: []corev1.Container{
 						{
 							Name:    "upgrade-network-fabric",
-							Image:   "bitnami/kubectl:latest",
+							Image:   "alpine/k8s:1.29.2",
 							Command: []string{"/bin/bash", "-c", script},
 						},
 					},

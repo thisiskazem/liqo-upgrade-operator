@@ -4,7 +4,7 @@
 
 **Production-grade Liqo upgrade** with validation, backup, rollback, and health checks:
 
-- ✅ **Stage 0: Validation & Freeze** - Multi-cluster version validation and operation freeze
+- ✅ **Stage 0: Validation** - Multi-cluster version validation
 - ✅ **Stage 1: CRDs** - All Liqo CRDs upgraded (15+ CRDs)
 - ✅ **Stage 2: Controller Manager** - liqo-controller-manager upgraded
 - ✅ **Stage 3: Network Fabric** - Gateway templates, liqo-ipam, liqo-proxy, liqo-fabric, and gateway instances upgraded
@@ -15,15 +15,25 @@
 
 ## What Works Now
 
-### Stage 0: Validation & Freeze Operations (Complete)
+### Stage 0: Validation & Discovery (Complete)
 - Cluster identity verification (checks liqo-controller-manager exists)
 - Local cluster version detection from controller-manager image
 - Remote cluster version retrieval from ForeignCluster CRs
 - Minimum version calculation across all clusters
 - Version compatibility matrix validation (ConfigMap-based)
-- Critical environment variables backup (POD_NAMESPACE, CLUSTER_ID, TENANT_NAMESPACE, etc.)
+- **Target version descriptor loading**:
+  - Loads expected component specifications for target version
+  - Validates target version is supported (descriptor exists)
+  - Provides upgrade planning foundation (current vs target comparison)
+  - Stored in ConfigMap (`liqo-target-descriptors`)
 - Component health checks
-- Freeze new offloads and peerings
+- **Live inventory snapshot** of all Liqo components:
+  - Core control plane (controller-manager, crd-replicator, webhook, etc.)
+  - Network fabric (ipam, proxy, fabric, gateways)
+  - Virtual kubelets (DaemonSets/Deployments)
+  - Per-tenant gateway deployments
+  - All Liqo CRDs with version information
+  - Snapshot stored in ConfigMap for rollback/verification
 
 ### Stage 1: CRD Upgrade (Complete)
 - Fetches CRD list from GitHub for target version
@@ -34,10 +44,8 @@
 
 ### Stage 2: Controller Manager Upgrade (Complete)
 - Backs up current deployment spec to /tmp/
-- Extracts and preserves critical environment variables
 - Updates image using kubectl set image
 - Waits for rollout completion (5 minute timeout)
-- Verifies environment variables were preserved
 - Deployment health checks (2 minute timeout)
 - Version verification (deployed == target)
 
@@ -64,8 +72,7 @@
 - Rolls back liqo-controller-manager if upgraded
 - Rolls back network fabric components if upgraded (gateway templates, ipam, proxy, fabric)
 - Uses lastSuccessfulPhase for partial rollback
-- Restores from environment backup ConfigMap
-- Verifies environment variables and health after rollback
+- Verifies health after rollback
 
 ---
 
@@ -73,10 +80,11 @@
 
 ### Components Upgraded
 
-**Stage 0 (Validation & Freeze):**
+**Stage 0 (Validation & Discovery):**
 - Version compatibility validation across multi-cluster setup
-- Environment configuration backup
-- Operation freeze (offloads, peerings)
+- Component health checks
+- Live inventory snapshot (all components, CRDs, images, args, env)
+- Upgrade plan generation (component/image/env/flag diffs)
 
 **Stage 1 (CRDs):**
 - All Liqo CustomResourceDefinitions (15+ CRDs fetched from GitHub)
@@ -124,7 +132,8 @@ The controller is modular with each stage in its own file:
 
 **Stage Implementations:**
 - `internal/controller/validation.go` - Stage 0: Validation phase
-- `internal/controller/freeze_operations.go` - Stage 0: Freeze operations phase
+- `internal/controller/snapshot.go` - Live inventory discovery and target descriptors
+- `internal/controller/planning.go` - Upgrade plan generation (snapshot vs descriptor comparison)
 - `internal/controller/crd_upgrade.go` - Stage 1: CRD upgrade
 - `internal/controller/controller_manager_upgrade.go` - Stage 2: Controller manager upgrade
 - `internal/controller/network_fabric_upgrade.go` - Stage 3: Network fabric upgrade
@@ -137,6 +146,8 @@ The controller is modular with each stage in its own file:
 **Configuration:**
 - `config/rbac/` - RBAC permissions
 - `config/crd/` - CRD definitions
+- `config/default/compatibility-configmap.yaml` - Version compatibility matrix
+- `config/default/target-descriptors-configmap.yaml` - Target version descriptors (v1.0.0, v1.0.1, etc.)
 
 ---
 
@@ -159,9 +170,16 @@ make manifests generate
 # Build and push controller image
 make docker-build docker-push IMG=<your-registry>/liqo-upgrade-controller:v0.4
 
-# Deploy to cluster
+# Deploy to cluster (includes RBAC, ConfigMaps, and controller)
 make deploy IMG=<your-registry>/liqo-upgrade-controller:v0.4
 ```
+
+**Note:** The `make deploy` command automatically deploys:
+- Controller deployment and RBAC
+- Version compatibility matrix ConfigMap (`liqo-version-compatibility`)
+- Target version descriptors ConfigMap (`liqo-target-descriptors`)
+
+These ConfigMaps are required for the controller to function properly.
 
 ### Create Upgrade CR
 
@@ -195,17 +213,22 @@ kubectl logs -n liqo-upgrade-controller-system -l control-plane=controller-manag
 ```
 User applies LiqoUpgrade CR
      ↓
-Stage 0: Validation (PhaseValidating) - 30s
+Stage 0: Validation & Discovery (PhaseValidating) - 30-50s
   └─> Verify cluster identity (liqo-controller-manager exists)
   └─> Detect local cluster version from controller-manager image
   └─> Retrieve remote cluster versions from ForeignCluster CRs
   └─> Find minimum version across all clusters
   └─> Validate compatibility using version matrix ConfigMap
-  └─> Backup critical environment variables to ConfigMap
+  └─> Load target version descriptor (expected components for target version)
   └─> Component health checks
-     ↓
-Stage 0: Freeze Operations (PhaseFreezingOperations) - 10s
-  └─> Block new offloads and peerings
+  └─> Create live inventory snapshot (all components + CRDs)
+  └─> Store snapshot in ConfigMap for rollback/verification
+  └─> Build upgrade plan (compare snapshot vs descriptor)
+      • Component set diff (create/update/delete)
+      • Image changes
+      • Environment variable changes
+      • Command-line flag changes
+  └─> Store upgrade plan in ConfigMap
      ↓
 Stage 1: CRD Upgrade (PhaseCRDs) - 1-2min
   └─> Fetch CRD list from GitHub for target version
@@ -216,10 +239,8 @@ Stage 1: CRD Upgrade (PhaseCRDs) - 1-2min
      ↓
 Stage 2: Controller Manager (PhaseControllerManager) - 3-5min
   └─> Backup current deployment spec to /tmp/
-  └─> Extract and preserve critical env vars
   └─> Update image using kubectl set image
   └─> Wait for rollout completion (5 min timeout)
-  └─> Verify environment variables preserved
   └─> Check deployment health (2 min timeout)
   └─> Verify deployed version matches target
      ↓
@@ -254,8 +275,7 @@ Rollback (PhaseRollingBack) - 3-5min
       └─> Restore liqo-proxy
       └─> Restore liqo-fabric
       └─> Restore gateway instances
-  └─> Restore environment variables from backup ConfigMap
-  └─> Verify environment variables and health
+  └─> Verify health
      ↓
 Status: Failed (PhaseFailed) ❌
 ```
@@ -323,13 +343,11 @@ $ kubectl get pods -n liqo-tenant-*
 
 All jobs have `ttlSecondsAfterFinished: 300` (auto-delete after 5 minutes):
 
-1. **liqo-validate-*** - Stage 0: Validates cluster and versions
-2. **liqo-freeze-*** - Stage 0: Freezes operations
-3. **liqo-upgrade-crd-*** - Stage 1: Upgrades CRDs
-4. **liqo-upgrade-controller-manager-*** - Stage 2: Upgrades controller-manager
-5. **liqo-upgrade-network-fabric-*** - Stage 3: Upgrades network fabric
-6. **liqo-verify-*** - Verification: Verifies health and version
-7. **liqo-rollback-*** (on failure) - Rollback: Restores previous version
+1. **liqo-upgrade-crd-*** - Stage 1: Upgrades CRDs
+2. **liqo-upgrade-controller-manager-*** - Stage 2: Upgrades controller-manager
+3. **liqo-upgrade-network-fabric-*** - Stage 3: Upgrades network fabric
+4. **liqo-verify-*** - Verification: Verifies health and version
+5. **liqo-rollback-*** (on failure) - Rollback: Restores previous version
 
 Jobs use `bitnami/kubectl` image and run bash scripts generated by the controller.
 
@@ -350,7 +368,6 @@ The controller has **smart rollback** based on `lastSuccessfulPhase`:
 
 **If Controller Manager upgrade fails:**
 - Rolls back liqo-controller-manager to previous version
-- Restores environment variables from backup ConfigMap
 
 **If Network Fabric upgrade fails:**
 - Rolls back liqo-controller-manager (if it was upgraded)
@@ -360,7 +377,6 @@ The controller has **smart rollback** based on `lastSuccessfulPhase`:
   - liqo-proxy Deployment
   - liqo-fabric DaemonSet
   - Gateway instances in tenant namespaces
-- Restores environment variables from backup ConfigMap
 
 **Rollback is enabled by default** and can be disabled by setting `spec.autoRollback: false` in the LiqoUpgrade CR.
 
@@ -408,14 +424,126 @@ kubectl logs -n liqo-upgrade-controller-system -l control-plane=controller-manag
 # Job logs (find the failing job)
 kubectl get jobs -n liqo
 kubectl logs job/<job-name> -n liqo
+
+# View live inventory snapshot
+kubectl get configmap liqo-upgrade-snapshot-<name> -n liqo -o jsonpath='{.data.snapshot\.json}' | jq .
 ```
+
+### Inspect Snapshot
+
+The live inventory snapshot contains detailed information about all Liqo components before the upgrade:
+
+```bash
+# Get snapshot ConfigMap name from upgrade status
+SNAPSHOT_CM=$(kubectl get liqoupgrade <name> -n liqo -o jsonpath='{.status.snapshotConfigMap}')
+
+# View full snapshot
+kubectl get configmap $SNAPSHOT_CM -n liqo -o jsonpath='{.data.snapshot\.json}' | jq .
+
+# List all inventoried components
+kubectl get configmap $SNAPSHOT_CM -n liqo -o jsonpath='{.data.snapshot\.json}' | jq '.components[] | {name, kind, namespace, image, exists}'
+
+# List all CRDs
+kubectl get configmap $SNAPSHOT_CM -n liqo -o jsonpath='{.data.snapshot\.json}' | jq '.crds[] | {name, versions, storageVersion}'
+
+# Check specific component details
+kubectl get configmap $SNAPSHOT_CM -n liqo -o jsonpath='{.data.snapshot\.json}' | jq '.components[] | select(.name=="liqo-controller-manager")'
+```
+
+### View Target Descriptor
+
+The target descriptor defines the expected component specifications for each Liqo version:
+
+```bash
+# View all available target versions
+kubectl get configmap liqo-target-descriptors -n liqo -o jsonpath='{.data}' | jq 'keys'
+
+# View descriptor for specific version
+kubectl get configmap liqo-target-descriptors -n liqo -o jsonpath='{.data.v1\.0\.1\.json}' | jq .
+
+# List expected components for target version
+kubectl get configmap liqo-target-descriptors -n liqo -o jsonpath='{.data.v1\.0\.1\.json}' | jq '.components[] | {name, kind, image: .image.repository + ":" + .image.tag}'
+
+# Check if target version is supported
+TARGET_VERSION="v1.0.1"
+kubectl get configmap liqo-target-descriptors -n liqo -o jsonpath="{.data.${TARGET_VERSION}\.json}" | jq . || echo "Version not supported"
+```
+
+### View Upgrade Plan
+
+The upgrade plan shows the computed differences between the current installation and the target version:
+
+```bash
+# Get upgrade plan ConfigMap name from upgrade status
+PLAN_CM=$(kubectl get liqoupgrade <name> -n liqo -o jsonpath='{.status.planConfigMap}')
+
+# View full upgrade plan
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq .
+
+# View components to create (new in target version)
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq '.toCreate[] | {name, kind, targetImage}'
+
+# View components to update (existing but need changes)
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq '.toUpdate[] | {name, kind, currentImage, targetImage, envChanges: (.envChanges | length), flagChanges: (.flagChanges | length)}'
+
+# View components to delete (removed in target version)
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq '.toDelete[] | {name, kind, currentImage}'
+
+# View specific component changes
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq '.toUpdate[] | select(.name=="liqo-controller-manager")'
+
+# View environment variable changes for a component
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq '.toUpdate[] | select(.name=="liqo-controller-manager") | .envChanges'
+
+# View flag/argument changes for a component
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq '.toUpdate[] | select(.name=="liqo-controller-manager") | .flagChanges'
+
+# Summary: count of changes by type
+kubectl get configmap $PLAN_CM -n liqo -o jsonpath='{.data.plan\.json}' | jq '{toCreate: (.toCreate | length), toUpdate: (.toUpdate | length), toDelete: (.toDelete | length)}'
+```
+
+The upgrade plan includes:
+- **toCreate**: Components that don't exist in current version but are in target
+- **toUpdate**: Components that exist but have changes (image, env, flags)
+- **toDelete**: Components that exist in current but not in target (deprecated)
+
+Each update includes:
+- **Image changes**: Current image → Target image
+- **Env changes**: Add/Update/Remove environment variables
+- **Flag changes**: Add/Update/Remove command-line flags
+
+### Missing ConfigMap Error
+
+If you get an error like `ConfigMap "liqo-target-descriptors" not found`:
+
+```bash
+# This means the required ConfigMaps were not deployed
+# Apply them manually:
+kubectl apply -f config/default/compatibility-configmap.yaml
+kubectl apply -f config/default/target-descriptors-configmap.yaml
+
+# Verify they were created:
+kubectl get configmap liqo-version-compatibility -n liqo
+kubectl get configmap liqo-target-descriptors -n liqo
+
+# Check available target versions:
+kubectl get configmap liqo-target-descriptors -n liqo -o jsonpath='{.data}' | jq 'keys'
+```
+
+**Note:** Newer versions of the Makefile automatically deploy these ConfigMaps. If you're using an older version, you can either:
+1. Manually apply the ConfigMaps as shown above, OR
+2. Update to the latest Makefile and redeploy: `make deploy IMG=<your-image>`
 
 ### Validation Fails
 
 ```bash
 # Error: Version compatibility check failed
 # Check the version matrix ConfigMap
-kubectl get configmap liqo-version-matrix -n liqo -o yaml
+kubectl get configmap liqo-version-compatibility -n liqo -o yaml
+
+# Error: No descriptor found for target version
+# Check available versions in target descriptors
+kubectl get configmap liqo-target-descriptors -n liqo -o jsonpath='{.data}' | jq 'keys'
 
 # Error: ForeignCluster version detection failed
 # Check ForeignCluster resources
@@ -533,12 +661,12 @@ CRD upgrades may introduce new fields or deprecate old ones. The controller uses
 
 ### Typical Timing
 
-- **Stage 0 (Validation & Freeze)**: ~30-40 seconds
+- **Stage 0 (Validation & Discovery)**: ~30-50 seconds (includes target descriptor + live inventory)
 - **Stage 1 (CRDs)**: ~1-2 minutes
 - **Stage 2 (Controller Manager)**: ~3-5 minutes
 - **Stage 3 (Network Fabric)**: ~5-10 minutes (depends on number of peerings)
 - **Verification**: ~1 minute
-- **Total**: ~10-18 minutes for complete upgrade
+- **Total**: ~10-20 minutes for complete upgrade
 
 ### Resource Usage
 
@@ -567,10 +695,13 @@ CRD upgrades may introduce new fields or deprecate old ones. The controller uses
    - Validates against version compatibility matrix (ConfigMap)
    - Prevents incompatible upgrades
 
-2. **Environment Configuration Backup**
-   - Critical environment variables backed up to ConfigMap before upgrade
-   - Variables: POD_NAMESPACE, CLUSTER_ID, TENANT_NAMESPACE, CLUSTER_ROLE, ENABLE_IPAM, LOG_LEVEL
-   - Restored during rollback or verified after upgrade
+2. **Live Inventory Snapshot**
+   - Comprehensive discovery of all Liqo components before upgrade
+   - Captures: images, args, env vars, resources, labels
+   - Inventories: deployments, daemonsets, cronjobs, per-tenant gateways
+   - Lists all Liqo CRDs with version information
+   - Stored in ConfigMap (`liqo-upgrade-snapshot-<name>`) for rollback
+   - Enables intelligent rollback and verification
 
 3. **Component Health Checks**
    - Pre-upgrade health verification
@@ -592,7 +723,6 @@ CRD upgrades may introduce new fields or deprecate old ones. The controller uses
    - Enabled by default (configurable via spec.autoRollback)
    - Triggered on job failure or health check failure
    - Partial rollback based on lastSuccessfulPhase (only rolls back what was upgraded)
-   - Restores from environment backup ConfigMap
 
 7. **Phase Tracking**
    - Tracks last successful phase in status
@@ -640,8 +770,9 @@ CRD upgrades may introduce new fields or deprecate old ones. The controller uses
 
 **Implemented Features:**
 - Multi-cluster version validation
+- Live inventory snapshot (all components, CRDs, configs)
 - CRD upgrade with server-side apply
-- Controller-manager upgrade with environment preservation
+- Controller-manager upgrade
 - Network fabric upgrade (ipam, proxy, fabric, gateways)
 - Automatic rollback on failure
 - Health checks and verification
@@ -671,4 +802,4 @@ CRD upgrades may introduce new fields or deprecate old ones. The controller uses
 
 - Check controller logs: `kubectl logs -n liqo-upgrade-controller-system -l control-plane=controller-manager -f`
 - Check job logs: `kubectl logs -n liqo -l app.kubernetes.io/component=controlplane-upgrade -f`
-- Describe upgrade: `kubectl describe liqoupgrade <name> -n liqo`
+- Describe upgrade: `kubectl describe liqoupgrade <name> -n liqo` 

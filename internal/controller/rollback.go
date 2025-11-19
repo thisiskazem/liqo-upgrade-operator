@@ -107,11 +107,6 @@ func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUp
 		namespace = "liqo"
 	}
 
-	backupConfigMapName := upgrade.Status.BackupName
-	if backupConfigMapName == "" {
-		backupConfigMapName = fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
-	}
-
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
 
@@ -121,23 +116,8 @@ echo "========================================="
 
 PREVIOUS_VERSION="%s"
 NAMESPACE="%s"
-BACKUP_CONFIGMAP="%s"
 
-echo "Step 1: Verifying environment backup exists..."
-if kubectl get configmap "${BACKUP_CONFIGMAP}" -n "${NAMESPACE}" &>/dev/null; then
-  echo "✓ Environment backup found"
-
-  # Extract critical env vars from backup
-  echo ""
-  echo "Step 2: Extracting environment variables from backup..."
-  kubectl get configmap "${BACKUP_CONFIGMAP}" -n "${NAMESPACE}" -o yaml > /tmp/env-backup.yaml
-  echo "Environment backup retrieved"
-else
-  echo "⚠️  Warning: Environment backup ConfigMap not found, proceeding without env restoration"
-fi
-
-echo ""
-echo "Step 3: Rolling back liqo-controller-manager image..."
+echo "Step 1: Rolling back liqo-controller-manager image..."
 PREVIOUS_IMAGE="ghcr.io/liqotech/liqo-controller-manager:${PREVIOUS_VERSION}"
 echo "Previous image: ${PREVIOUS_IMAGE}"
 
@@ -146,21 +126,21 @@ kubectl set image deployment/liqo-controller-manager \
   -n "${NAMESPACE}"
 
 echo ""
-echo "Step 4: Waiting for rollback rollout..."
+echo "Step 2: Waiting for rollback rollout..."
 if ! kubectl rollout status deployment/liqo-controller-manager -n "${NAMESPACE}" --timeout=5m; then
   echo "❌ ERROR: Rollback rollout failed!"
   exit 1
 fi
 
 echo ""
-echo "Step 5: Verifying rollback health..."
+echo "Step 3: Verifying rollback health..."
 if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "${NAMESPACE}"; then
   echo "❌ ERROR: Deployment not healthy after rollback!"
   exit 1
 fi
 
 echo ""
-echo "Step 6: Verifying version rollback..."
+echo "Step 4: Verifying version rollback..."
 DEPLOYED_VERSION=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f2)
 echo "Deployed version after rollback: ${DEPLOYED_VERSION}"
 
@@ -169,33 +149,12 @@ if [ "${DEPLOYED_VERSION}" != "${PREVIOUS_VERSION}" ]; then
   exit 1
 fi
 
-echo ""
-echo "Step 7: Verifying critical environment variables..."
-# List of critical env vars that should be present
-CRITICAL_VARS=(
-  "POD_NAMESPACE"
-  "CLUSTER_ID"
-  "TENANT_NAMESPACE"
-  "CLUSTER_ROLE"
-  "ENABLE_IPAM"
-  "LOG_LEVEL"
-)
-
-for var in "${CRITICAL_VARS[@]}"; do
-  value=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='${var}')].value}" 2>/dev/null || echo "")
-  if [ -n "$value" ]; then
-    echo "  ✓ ${var}=${value}"
-  else
-    echo "  ⚠️  ${var} not found (may use valueFrom)"
-  fi
-done
-
 # Rollback CRDs if needed (based on lastSuccessfulPhase)
 LAST_PHASE="%s"
 
 if [ "$LAST_PHASE" = "UpgradingNetworkFabric" ]; then
   echo ""
-  echo "Step 8: Rolling back network fabric components..."
+  echo "Step 5: Rolling back network fabric components..."
 
   # Find all liqo-tenant-* namespaces for gateway deployments
   TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
@@ -305,8 +264,7 @@ fi
 echo ""
 echo "✅ Rollback complete"
 echo "✅ Controller-manager restored to ${PREVIOUS_VERSION}"
-echo "✅ Environment variables verified"
-`, upgrade.Status.PreviousVersion, upgrade.Status.PreviousVersion, namespace, backupConfigMapName, upgrade.Status.LastSuccessfulPhase)
+`, upgrade.Status.PreviousVersion, upgrade.Status.PreviousVersion, namespace, upgrade.Status.LastSuccessfulPhase)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

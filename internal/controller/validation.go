@@ -23,13 +23,11 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
 
@@ -99,11 +97,13 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 	}
 	logger.Info("Compatibility check passed", "from", minimumVersion, "to", upgrade.Spec.TargetVersion)
 
-	// Step 6: Backup critical environment variables and flags
-	logger.Info("Step 6: Backing up environment variables and configuration")
-	if err := r.backupEnvironmentConfig(ctx, upgrade, namespace); err != nil {
-		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to backup environment config: %v", err))
+	// Step 6: Load target version descriptor
+	logger.Info("Step 6: Loading target version descriptor")
+	targetDescriptor, err := r.loadTargetDescriptor(ctx, upgrade.Spec.TargetVersion, namespace)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to load target descriptor: %v", err))
 	}
+	logger.Info("Target descriptor loaded successfully", "version", targetDescriptor.Version, "components", len(targetDescriptor.Components))
 
 	// Step 7: Check component health
 	logger.Info("Step 7: Checking component health")
@@ -111,7 +111,30 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 		return r.fail(ctx, upgrade, fmt.Sprintf("Component health check failed: %v", err))
 	}
 
-	// Step 8: Save previous version (local version)
+	// Step 8: Create live inventory and snapshot
+	logger.Info("Step 8: Creating live inventory snapshot")
+	snapshot, err := r.createLiveInventory(ctx, namespace, localVersion)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create live inventory: %v", err))
+	}
+
+	if err := r.createSnapshotConfigMap(ctx, upgrade, snapshot, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create snapshot ConfigMap: %v", err))
+	}
+
+	// Step 9: Build upgrade plan (compare snapshot vs target descriptor)
+	logger.Info("Step 9: Building upgrade plan")
+	plan, err := r.buildUpgradePlan(ctx, snapshot, targetDescriptor)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to build upgrade plan: %v", err))
+	}
+
+	if err := r.createUpgradePlanConfigMap(ctx, upgrade, plan, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create upgrade plan ConfigMap: %v", err))
+	}
+	logger.Info("Upgrade plan created", "toCreate", len(plan.ToCreate), "toUpdate", len(plan.ToUpdate), "toDelete", len(plan.ToDelete))
+
+	// Step 10: Save previous version (local version)
 	upgrade.Status.PreviousVersion = localVersion
 
 	// Add Compatible condition
@@ -124,18 +147,17 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 	}
 
 	statusUpdates := map[string]interface{}{
-		"previousVersion": localVersion,
-		"conditions":      []metav1.Condition{condition},
-		"backupReady":     upgrade.Status.BackupReady,
-		"backupName":      upgrade.Status.BackupName,
+		"previousVersion":   localVersion,
+		"snapshotConfigMap": upgrade.Status.SnapshotConfigMap,
+		"conditions":        []metav1.Condition{condition},
 	}
 
 	if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseValidating, "Validation completed successfully", statusUpdates); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Move to next phase: Freeze operations
-	return r.startFreezeOperations(ctx, upgrade)
+	// Move to next phase: CRD Upgrade
+	return r.startCRDUpgrade(ctx, upgrade)
 }
 
 func (r *LiqoUpgradeReconciler) verifyClusterIdentity(ctx context.Context, namespace string) error {
@@ -189,115 +211,6 @@ func (r *LiqoUpgradeReconciler) verifyComponentHealth(ctx context.Context, names
 	if deployment.Status.ReadyReplicas < 1 {
 		return fmt.Errorf("liqo-controller-manager not ready: %d/%d", deployment.Status.ReadyReplicas, *deployment.Spec.Replicas)
 	}
-
-	return nil
-}
-
-// backupEnvironmentConfig backs up critical environment variables and configuration
-func (r *LiqoUpgradeReconciler) backupEnvironmentConfig(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, namespace string) error {
-	logger := log.FromContext(ctx)
-
-	// Create a ConfigMap to store environment variable backups
-	backupConfigMapName := fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
-
-	// Get liqo-controller-manager deployment
-	deployment := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      "liqo-controller-manager",
-		Namespace: namespace,
-	}, deployment)
-	if err != nil {
-		return fmt.Errorf("failed to get controller-manager deployment: %w", err)
-	}
-
-	// Extract environment variables from all containers
-	envData := make(map[string]string)
-	for _, container := range deployment.Spec.Template.Spec.Containers {
-		for _, env := range container.Env {
-			key := fmt.Sprintf("%s_%s", container.Name, env.Name)
-			if env.Value != "" {
-				envData[key] = env.Value
-			} else if env.ValueFrom != nil {
-				// Store reference info for ValueFrom
-				envData[key+"_type"] = "valueFrom"
-			}
-		}
-
-		// Store container args/command
-		if len(container.Args) > 0 {
-			envData[container.Name+"_args"] = strings.Join(container.Args, " ")
-		}
-		if len(container.Command) > 0 {
-			envData[container.Name+"_command"] = strings.Join(container.Command, " ")
-		}
-	}
-
-	// Critical environment variables that must be preserved (Stage 2)
-	criticalEnvVars := []string{
-		"POD_NAMESPACE",
-		"CLUSTER_ID",
-		"TENANT_NAMESPACE",
-		"CLUSTER_ROLE",
-		"ENABLE_IPAM",
-		"LOG_LEVEL",
-	}
-
-	// Verify critical env vars are present
-	for _, envVar := range criticalEnvVars {
-		found := false
-		for key := range envData {
-			if strings.Contains(key, envVar) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			logger.Info("Warning: critical environment variable not found in backup", "variable", envVar)
-		}
-	}
-
-	// Create backup ConfigMap
-	backupConfigMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      backupConfigMapName,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      "liqo-upgrade",
-				"app.kubernetes.io/component": "env-backup",
-				"upgrade.liqo.io/upgrade":     upgrade.Name,
-			},
-		},
-		Data: envData,
-	}
-
-	if err := controllerutil.SetControllerReference(upgrade, backupConfigMap, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	// Create or update the ConfigMap
-	existingConfigMap := &corev1.ConfigMap{}
-	err = r.Get(ctx, types.NamespacedName{Name: backupConfigMapName, Namespace: namespace}, existingConfigMap)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			if err := r.Create(ctx, backupConfigMap); err != nil {
-				return fmt.Errorf("failed to create backup ConfigMap: %w", err)
-			}
-			logger.Info("Environment config backup created", "configmap", backupConfigMapName)
-		} else {
-			return fmt.Errorf("failed to check backup ConfigMap: %w", err)
-		}
-	} else {
-		// Update existing
-		existingConfigMap.Data = envData
-		if err := r.Update(ctx, existingConfigMap); err != nil {
-			return fmt.Errorf("failed to update backup ConfigMap: %w", err)
-		}
-		logger.Info("Environment config backup updated", "configmap", backupConfigMapName)
-	}
-
-	// Store backup name in upgrade status for later use
-	upgrade.Status.BackupName = backupConfigMapName
-	upgrade.Status.BackupReady = true
 
 	return nil
 }
