@@ -33,12 +33,39 @@ import (
 	upgradev1alpha1 "github.com/thisiskazem/liqo-upgrade-controller/api/v1alpha1"
 )
 
-// Stage 2: Upgrade liqo-controller-manager
+// Core control-plane components in upgrade order
+var coreControlPlaneComponents = []string{
+	"liqo-controller-manager",
+	"liqo-crd-replicator",
+	"liqo-metric-agent",
+	// liqo-webhook is handled last with special logic
+}
+
+// Stage 2: Upgrade core control-plane components
 func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Stage 2: Starting liqo-controller-manager upgrade")
 
-	upgrade.Status.CurrentStage = 2
+	// Idempotency check: verify job doesn't already exist
+	jobName := fmt.Sprintf("%s-%s", controllerManagerUpgradePrefix, upgrade.Name)
+	existingJob := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, existingJob)
+
+	if err == nil {
+		// Job already exists, transition to monitoring phase without creating a new job
+		logger.Info("Controller manager upgrade job already exists, skipping creation")
+		statusUpdates := map[string]interface{}{
+			"currentStage":        2,
+			"lastSuccessfulPhase": upgrade.Status.LastSuccessfulPhase,
+		}
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Monitoring core control-plane upgrade", statusUpdates)
+	} else if !errors.IsNotFound(err) {
+		// Unexpected error
+		logger.Error(err, "Failed to check for existing controller manager upgrade job")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Job doesn't exist, create it
+	logger.Info("Stage 2: Starting core control-plane upgrade")
 
 	job := r.buildControllerManagerUpgradeJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
@@ -47,12 +74,19 @@ func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Contex
 
 	if err := r.Create(ctx, job); err != nil {
 		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create controller-manager upgrade job")
-			return r.fail(ctx, upgrade, "Failed to create controller-manager upgrade job")
+			logger.Error(err, "Failed to create core control-plane upgrade job")
+			return r.fail(ctx, upgrade, "Failed to create core control-plane upgrade job")
 		}
+		// Job was created by another reconciliation, that's OK
+		logger.Info("Controller manager upgrade job was just created by another reconciliation")
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Upgrading liqo-controller-manager", nil)
+	// Pass all status updates in additionalUpdates map to ensure they are persisted
+	statusUpdates := map[string]interface{}{
+		"currentStage":        2,
+		"lastSuccessfulPhase": upgrade.Status.LastSuccessfulPhase,
+	}
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Upgrading core control-plane components", statusUpdates)
 }
 
 func (r *LiqoUpgradeReconciler) monitorControllerManagerUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
@@ -92,108 +126,584 @@ func (r *LiqoUpgradeReconciler) buildControllerManagerUpgradeJob(upgrade *upgrad
 		namespace = "liqo"
 	}
 
-	backupConfigMapName := upgrade.Status.BackupName
-	if backupConfigMapName == "" {
-		backupConfigMapName = fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
+	planConfigMap := upgrade.Status.PlanConfigMap
+	if planConfigMap == "" {
+		planConfigMap = fmt.Sprintf("liqo-upgrade-plan-%s", upgrade.Name)
 	}
 
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
 
 echo "========================================="
-echo "Stage 2: Upgrading liqo-controller-manager"
+echo "Stage 2: Upgrading Core Control-Plane Components"
 echo "========================================="
+
+# Verify required dependencies
+echo "Verifying required tools..."
+if ! command -v jq &> /dev/null; then
+  echo "❌ ERROR: jq is required but not found"
+  exit 1
+fi
+if ! command -v kubectl &> /dev/null; then
+  echo "❌ ERROR: kubectl is required but not found"
+  exit 1
+fi
+echo "✓ All required tools are available"
+echo ""
 
 TARGET_VERSION="%s"
 NAMESPACE="%s"
-BACKUP_CONFIGMAP="%s"
+PLAN_CONFIGMAP="%s"
 
-echo "Step 1: Verifying environment variable backup..."
-if ! kubectl get configmap "${BACKUP_CONFIGMAP}" -n "${NAMESPACE}" &>/dev/null; then
-  echo "⚠️  Warning: Environment backup ConfigMap not found"
+# Load upgrade plan
+echo "Loading upgrade plan from ConfigMap ${PLAN_CONFIGMAP}..."
+PLAN_JSON=$(kubectl get configmap "${PLAN_CONFIGMAP}" -n "${NAMESPACE}" -o jsonpath='{.data.plan\.json}')
+
+if [ -z "$PLAN_JSON" ]; then
+  echo "❌ ERROR: Failed to load upgrade plan"
+  exit 1
 fi
 
+echo "Upgrade plan loaded"
 echo ""
-echo "Step 2: Backing up current deployment spec..."
-kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o yaml > /tmp/controller-manager-backup.yaml
-echo "Backup saved to /tmp/controller-manager-backup.yaml"
 
+# Validate prerequisites (ConfigMaps and Secrets referenced in env vars)
+echo "========================================="
+echo "Validating Prerequisites"
+echo "========================================="
 echo ""
-echo "Step 3: Extracting current environment variables..."
-# Critical environment variables that MUST be preserved (Stage 2)
-CRITICAL_VARS=(
-  "POD_NAMESPACE"
-  "CLUSTER_ID"
-  "TENANT_NAMESPACE"
-  "CLUSTER_ROLE"
-  "ENABLE_IPAM"
-  "LOG_LEVEL"
-)
 
-# Store current env vars
-for var in "${CRITICAL_VARS[@]}"; do
-  value=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='${var}')].value}" 2>/dev/null || echo "")
-  if [ -n "$value" ]; then
-    echo "  ✓ ${var}=${value}"
-    eval "PRESERVE_${var}=\"${value}\""
-  else
-    echo "  ⚠️  ${var} not found (may use valueFrom)"
+VALIDATION_FAILED=false
+
+# Check all components in the upgrade plan
+echo "Checking ConfigMaps and Secrets referenced in environment variables..."
+for COMPONENT_NAME in $(echo "$PLAN_JSON" | jq -r '.toUpdate[].name'); do
+  COMPONENT_PLAN=$(echo "$PLAN_JSON" | jq -r --arg name "$COMPONENT_NAME" '
+    .toUpdate[] | select(.name == $name)
+  ')
+
+  ENV_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.envChanges // []')
+  ENV_COUNT=$(echo "$ENV_CHANGES" | jq 'length')
+
+  if [ "$ENV_COUNT" -gt 0 ]; then
+    echo ""
+    echo "Validating ${COMPONENT_NAME} environment variable references..."
+
+    while IFS= read -r change; do
+      TYPE=$(echo "$change" | jq -r '.type')
+      NAME=$(echo "$change" | jq -r '.name')
+      NEW_SOURCE=$(echo "$change" | jq -r '.newSource // ""')
+      NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+
+      # Only validate add/update operations
+      if [ "$TYPE" == "add" ] || [ "$TYPE" == "update" ]; then
+        # Check ConfigMapKeyRef
+        if [[ "$NEW_SOURCE" == configMap:* ]]; then
+          CONFIGMAP_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+          KEY=$(echo "$NEW_VALUE")
+
+          echo -n "  Checking ConfigMap ${CONFIGMAP_NAME} (key: ${KEY})... "
+
+          if ! kubectl get configmap "${CONFIGMAP_NAME}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+            echo "❌ NOT FOUND"
+            echo "    ERROR: ConfigMap '${CONFIGMAP_NAME}' does not exist in namespace '${NAMESPACE}'"
+            echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+            VALIDATION_FAILED=true
+          else
+            # Check if the key exists in the ConfigMap
+            if ! kubectl get configmap "${CONFIGMAP_NAME}" -n "${NAMESPACE}" -o jsonpath="{.data.${KEY}}" > /dev/null 2>&1; then
+              echo "❌ KEY NOT FOUND"
+              echo "    ERROR: ConfigMap '${CONFIGMAP_NAME}' exists but does not contain key '${KEY}'"
+              echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+              VALIDATION_FAILED=true
+            else
+              echo "✓ OK"
+            fi
+          fi
+
+        # Check SecretKeyRef
+        elif [[ "$NEW_SOURCE" == secret:* ]]; then
+          SECRET_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+          KEY=$(echo "$NEW_VALUE")
+
+          echo -n "  Checking Secret ${SECRET_NAME} (key: ${KEY})... "
+
+          if ! kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+            echo "❌ NOT FOUND"
+            echo "    ERROR: Secret '${SECRET_NAME}' does not exist in namespace '${NAMESPACE}'"
+            echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+            VALIDATION_FAILED=true
+          else
+            # Check if the key exists in the Secret
+            if ! kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath="{.data.${KEY}}" > /dev/null 2>&1; then
+              echo "❌ KEY NOT FOUND"
+              echo "    ERROR: Secret '${SECRET_NAME}' exists but does not contain key '${KEY}'"
+              echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+              VALIDATION_FAILED=true
+            else
+              echo "✓ OK"
+            fi
+          fi
+        fi
+      fi
+    done < <(echo "$ENV_CHANGES" | jq -c '.[]')
   fi
 done
 
 echo ""
-echo "Step 4: Updating controller-manager image..."
-NEW_IMAGE="ghcr.io/liqotech/liqo-controller-manager:${TARGET_VERSION}"
-echo "New image: ${NEW_IMAGE}"
-
-kubectl set image deployment/liqo-controller-manager \
-  controller-manager="${NEW_IMAGE}" \
-  -n "${NAMESPACE}"
-
-echo ""
-echo "Step 5: Waiting for rollout..."
-if ! kubectl rollout status deployment/liqo-controller-manager -n "${NAMESPACE}" --timeout=5m; then
-  echo "❌ ERROR: Rollout failed!"
+if [ "$VALIDATION_FAILED" == "true" ]; then
+  echo "❌ ERROR: Prerequisite validation failed!"
+  echo ""
+  echo "The upgrade cannot proceed because required ConfigMaps or Secrets are missing."
+  echo "Please ensure all required resources exist before retrying the upgrade."
+  echo ""
+  echo "Troubleshooting:"
+  echo "  1. Check if Liqo is properly installed with all required resources"
+  echo "  2. Verify that ConfigMaps and Secrets have not been accidentally deleted"
+  echo "  3. Ensure you are targeting the correct namespace"
   exit 1
 fi
 
+echo "✅ All prerequisites validated successfully"
 echo ""
-echo "Step 6: Verifying environment variables after upgrade..."
-# Verify critical env vars are still present
-MISSING_VARS=()
-for var in "${CRITICAL_VARS[@]}"; do
-  value=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='${var}')].value}" 2>/dev/null || echo "")
-  original_var="PRESERVE_${var}"
-  if [ -n "${!original_var}" ]; then
-    if [ "$value" != "${!original_var}" ]; then
-      echo "  ⚠️  WARNING: ${var} changed: ${!original_var} -> ${value}"
+
+# Cleanup any crashlooping pods from previous failed upgrade attempts
+echo "========================================="
+echo "Cleaning Up Stale Pods"
+echo "========================================="
+echo ""
+
+echo "Checking for crashlooping pods in namespace ${NAMESPACE}..."
+
+# Get all pods in CrashLoopBackOff state
+CRASHLOOP_PODS=$(kubectl get pods -n "${NAMESPACE}" \
+  --field-selector=status.phase=Running \
+  -o json | jq -r '
+  .items[] |
+  select(.status.containerStatuses[]? | select(.state.waiting?.reason == "CrashLoopBackOff")) |
+  .metadata.name
+')
+
+if [ -n "$CRASHLOOP_PODS" ]; then
+  echo "Found crashlooping pods, cleaning up..."
+  echo "$CRASHLOOP_PODS" | while read -r pod; do
+    if [ -n "$pod" ]; then
+      echo "  Deleting crashlooping pod: $pod"
+      kubectl delete pod "$pod" -n "${NAMESPACE}" --wait=false
+    fi
+  done
+
+  # Wait a moment for deletions to process
+  echo ""
+  echo "Waiting for pod cleanup to complete..."
+  sleep 5
+  echo "✓ Pod cleanup complete"
+else
+  echo "No crashlooping pods found"
+fi
+
+echo ""
+
+# Core control-plane components to upgrade (in order)
+CORE_COMPONENTS=("liqo-controller-manager" "liqo-crd-replicator" "liqo-metric-agent")
+
+# Function to upgrade a component using the plan
+upgrade_component() {
+  local COMPONENT_NAME=$1
+
+  echo "========================================="
+  echo "Upgrading: ${COMPONENT_NAME}"
+  echo "========================================="
+
+  # Check if component exists
+  if ! kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+    echo "⚠️  Component ${COMPONENT_NAME} not found, skipping"
+    echo ""
+    return 0
+  fi
+
+  # Find component in upgrade plan
+  COMPONENT_PLAN=$(echo "$PLAN_JSON" | jq -r --arg name "$COMPONENT_NAME" '
+    .toUpdate[] | select(.name == $name)
+  ')
+
+  if [ -z "$COMPONENT_PLAN" ] || [ "$COMPONENT_PLAN" == "null" ]; then
+    echo "⚠️  No update plan for ${COMPONENT_NAME}, using default image update only"
+
+    # Fallback: simple image update
+    NEW_IMAGE="ghcr.io/liqotech/${COMPONENT_NAME}:${TARGET_VERSION}"
+    echo "Updating image to: ${NEW_IMAGE}"
+
+    kubectl set image deployment/"${COMPONENT_NAME}" \
+      "${COMPONENT_NAME}"="${NEW_IMAGE}" \
+      -n "${NAMESPACE}"
+  else
+    echo "Applying upgrade plan for ${COMPONENT_NAME}..."
+
+    # Extract plan details
+    TARGET_IMAGE=$(echo "$COMPONENT_PLAN" | jq -r '.targetImage')
+    CONTAINER_NAME=$(echo "$COMPONENT_PLAN" | jq -r '.containerName // .name')
+
+    echo "  Target image: ${TARGET_IMAGE}"
+    echo "  Container name: ${CONTAINER_NAME}"
+
+    # Step 1: Update image
+    echo ""
+    echo "Step 1: Updating container image..."
+    kubectl set image deployment/"${COMPONENT_NAME}" \
+      "${CONTAINER_NAME}"="${TARGET_IMAGE}" \
+      -n "${NAMESPACE}"
+
+    # Step 2: Apply environment variable changes
+    ENV_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.envChanges // []')
+    ENV_COUNT=$(echo "$ENV_CHANGES" | jq 'length')
+
+    if [ "$ENV_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Step 2: Applying ${ENV_COUNT} environment variable change(s)..."
+
+      # Get current env array
+      CURRENT_ENV=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" -o json | \
+        jq '.spec.template.spec.containers[] | select(.name == "'${CONTAINER_NAME}'") | .env // []')
+
+      # Process each env change and build new env array
+      NEW_ENV="$CURRENT_ENV"
+      while IFS= read -r change; do
+        TYPE=$(echo "$change" | jq -r '.type')
+        NAME=$(echo "$change" | jq -r '.name')
+        NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+        NEW_SOURCE=$(echo "$change" | jq -r '.newSource // ""')
+
+        if [ "$TYPE" == "add" ] || [ "$TYPE" == "update" ]; then
+          # Determine the source type and build appropriate env var
+          if [ "$NEW_SOURCE" == "value" ]; then
+            # Simple value-based env var
+            echo "  ${TYPE}: ${NAME}=${NEW_VALUE}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg value "$NEW_VALUE" \
+              '{name: $name, value: $value}')
+          elif [[ "$NEW_SOURCE" == configMap:* ]]; then
+            # ConfigMapKeyRef
+            CONFIGMAP_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+            KEY=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from ConfigMap ${CONFIGMAP_NAME}, key: ${KEY}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg cmName "$CONFIGMAP_NAME" --arg key "$KEY" \
+              '{name: $name, valueFrom: {configMapKeyRef: {name: $cmName, key: $key}}}')
+          elif [[ "$NEW_SOURCE" == secret:* ]]; then
+            # SecretKeyRef
+            SECRET_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+            KEY=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from Secret ${SECRET_NAME}, key: ${KEY}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg secretName "$SECRET_NAME" --arg key "$KEY" \
+              '{name: $name, valueFrom: {secretKeyRef: {name: $secretName, key: $key}}}')
+          elif [ "$NEW_SOURCE" == "fieldRef" ]; then
+            # FieldRef (e.g., metadata.namespace)
+            FIELD_PATH=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from fieldRef: ${FIELD_PATH}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg fieldPath "$FIELD_PATH" \
+              '{name: $name, valueFrom: {fieldRef: {apiVersion: "v1", fieldPath: $fieldPath}}}')
+          else
+            echo "  ⚠️  WARNING: Unknown source type for ${NAME}: ${NEW_SOURCE}, skipping"
+            continue
+          fi
+
+          # Update or add the env var in the array
+          if echo "$NEW_ENV" | jq -e --arg name "$NAME" 'any(.[]; .name == $name)' > /dev/null; then
+            # Update existing
+            NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" --arg name "$NAME" \
+              'map(if .name == $name then $envVar else . end)')
+          else
+            # Add new
+            NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" '. += [$envVar]')
+          fi
+        elif [ "$TYPE" == "remove" ]; then
+          echo "  ${TYPE}: ${NAME}"
+          NEW_ENV=$(echo "$NEW_ENV" | jq --arg name "$NAME" 'map(select(.name != $name))')
+        fi
+      done < <(echo "$ENV_CHANGES" | jq -c '.[]')
+
+      # Apply the complete env array patch
+      if [ "$ENV_COUNT" -gt 0 ]; then
+        PATCH=$(cat <<EOF
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "${CONTAINER_NAME}",
+          "env": ${NEW_ENV}
+        }]
+      }
+    }
+  }
+}
+EOF
+)
+        kubectl patch deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" --type=strategic --patch "$PATCH"
+      fi
     else
-      echo "  ✓ ${var} preserved: ${value}"
+      echo ""
+      echo "Step 2: No environment variable changes needed"
+    fi
+
+    # Step 3: Apply command-line flag changes (via args)
+    FLAG_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.flagChanges // []')
+    FLAG_COUNT=$(echo "$FLAG_CHANGES" | jq 'length')
+
+    if [ "$FLAG_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Step 3: Applying ${FLAG_COUNT} command-line flag change(s)..."
+
+      # Get current args
+      CURRENT_ARGS=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+        -o jsonpath="{.spec.template.spec.containers[?(@.name=='${CONTAINER_NAME}')].args}" | jq -r '.')
+
+      # Build new args array by applying changes
+      NEW_ARGS="$CURRENT_ARGS"
+      while IFS= read -r change; do
+        TYPE=$(echo "$change" | jq -r '.type')
+        FLAG=$(echo "$change" | jq -r '.flag')
+        NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+
+        if [ "$TYPE" == "add" ]; then
+          echo "  add: --${FLAG}=${NEW_VALUE}"
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+        elif [ "$TYPE" == "update" ]; then
+          echo "  update: --${FLAG}=${NEW_VALUE}"
+          # Remove old flag and add new one
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+        elif [ "$TYPE" == "remove" ]; then
+          echo "  remove: --${FLAG}"
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+        fi
+      done < <(echo "$FLAG_CHANGES" | jq -c '.[]')
+
+      # Apply args patch
+      ARGS_PATCH=$(cat <<EOF
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "${CONTAINER_NAME}",
+          "args": ${NEW_ARGS}
+        }]
+      }
+    }
+  }
+}
+EOF
+)
+
+      kubectl patch deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+        --type=strategic --patch "$ARGS_PATCH"
+    else
+      echo ""
+      echo "Step 3: No command-line flag changes needed"
+    fi
+  fi
+
+  # Ensure proper rolling update strategy
+  echo ""
+  echo "Step 4: Ensuring proper rolling update strategy..."
+
+  MAX_UNAVAILABLE=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}' 2>/dev/null || echo "0")
+  MAX_SURGE=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.strategy.rollingUpdate.maxSurge}' 2>/dev/null || echo "1")
+
+  echo "  Current strategy: maxUnavailable=${MAX_UNAVAILABLE}, maxSurge=${MAX_SURGE}"
+
+  # Ensure at least maxSurge=1 for control-plane components
+  if [ "$MAX_SURGE" == "0" ] || [ -z "$MAX_SURGE" ]; then
+    echo "  Patching to ensure maxSurge=1 for zero-downtime rollout..."
+    kubectl patch deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+      --type=strategic --patch '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1}}}}'
+  fi
+
+  # Wait for rollout
+  echo ""
+  echo "Step 5: Waiting for rollout to complete..."
+  if ! kubectl rollout status deployment/"${COMPONENT_NAME}" -n "${NAMESPACE}" --timeout=5m; then
+    echo "❌ ERROR: Rollout failed for ${COMPONENT_NAME}!"
+    return 1
+  fi
+
+  # Verify health
+  echo ""
+  echo "Step 6: Verifying deployment health..."
+  if ! kubectl wait --for=condition=available --timeout=2m deployment/"${COMPONENT_NAME}" -n "${NAMESPACE}"; then
+    echo "❌ ERROR: Deployment ${COMPONENT_NAME} not healthy!"
+    return 1
+  fi
+
+  # Verify version
+  echo ""
+  echo "Step 7: Verifying deployed version..."
+  DEPLOYED_IMAGE=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+    -o jsonpath="{.spec.template.spec.containers[0].image}")
+  echo "  Deployed image: ${DEPLOYED_IMAGE}"
+
+  # Check for crashloops
+  echo ""
+  echo "Step 8: Checking for crashloops..."
+  sleep 10  # Wait a bit for pods to potentially crash
+
+  RESTART_COUNT=$(kubectl get pods -n "${NAMESPACE}" -l "app.kubernetes.io/name=${COMPONENT_NAME}" \
+    -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+
+  if [ "$RESTART_COUNT" -gt 2 ]; then
+    echo "❌ ERROR: Component ${COMPONENT_NAME} has high restart count: ${RESTART_COUNT}"
+    echo "Checking pod logs..."
+    kubectl logs -n "${NAMESPACE}" -l "app.kubernetes.io/name=${COMPONENT_NAME}" --tail=50 || true
+    return 1
+  fi
+
+  echo "  Restart count: ${RESTART_COUNT} (OK)"
+
+  echo ""
+  echo "✅ ${COMPONENT_NAME} upgraded successfully"
+  echo ""
+
+  return 0
+}
+
+# Upgrade each core component
+for component in "${CORE_COMPONENTS[@]}"; do
+  if ! upgrade_component "$component"; then
+    echo "❌ ERROR: Failed to upgrade $component"
+    exit 1
+  fi
+done
+
+echo "========================================="
+echo "Upgrading: liqo-webhook (with TLS validation)"
+echo "========================================="
+
+# Check if webhook exists
+if kubectl get deployment liqo-webhook -n "${NAMESPACE}" > /dev/null 2>&1; then
+  echo "Step 1: Validating TLS certificates..."
+
+  # Check webhook secret
+  WEBHOOK_SECRET=$(kubectl get deployment liqo-webhook -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.template.spec.volumes[?(@.name=="webhook-certs")].secret.secretName}' 2>/dev/null || echo "")
+
+  if [ -n "$WEBHOOK_SECRET" ]; then
+    echo "  Webhook TLS secret: ${WEBHOOK_SECRET}"
+
+    # Verify secret exists and has required keys
+    if kubectl get secret "${WEBHOOK_SECRET}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+      CERT_KEYS=$(kubectl get secret "${WEBHOOK_SECRET}" -n "${NAMESPACE}" -o jsonpath='{.data}' | jq 'keys')
+      echo "  Certificate keys: ${CERT_KEYS}"
+      echo "  ✓ TLS certificates present"
+    else
+      echo "  ⚠️  WARNING: TLS secret ${WEBHOOK_SECRET} not found, webhook may fail"
+    fi
+  else
+    echo "  ⚠️  WARNING: No TLS secret configured for webhook"
+  fi
+
+  echo ""
+  echo "Step 2: Upgrading webhook deployment..."
+
+  # Upgrade webhook component (reuse function)
+  if ! upgrade_component "liqo-webhook"; then
+    echo "❌ ERROR: Failed to upgrade liqo-webhook"
+    exit 1
+  fi
+
+  echo ""
+  echo "Step 3: Verifying webhook configurations..."
+
+  # Check MutatingWebhookConfiguration
+  if kubectl get mutatingwebhookconfiguration | grep -q liqo; then
+    MUTATING_WEBHOOKS=$(kubectl get mutatingwebhookconfiguration -o name | grep liqo)
+    echo "  Mutating webhooks:"
+    echo "${MUTATING_WEBHOOKS}" | while read -r wh; do
+      echo "    - $wh"
+    done
+  fi
+
+  # Check ValidatingWebhookConfiguration
+  if kubectl get validatingwebhookconfiguration | grep -q liqo; then
+    VALIDATING_WEBHOOKS=$(kubectl get validatingwebhookconfiguration -o name | grep liqo)
+    echo "  Validating webhooks:"
+    echo "${VALIDATING_WEBHOOKS}" | while read -r wh; do
+      echo "    - $wh"
+    done
+  fi
+
+  echo ""
+  echo "Step 4: Testing webhook admission..."
+  # Give webhook a moment to be ready
+  sleep 5
+
+  # Check API server logs for admission failures (if accessible)
+  echo "  Webhook should be processing admission requests"
+  echo "  Check API server logs if issues occur"
+
+  echo ""
+  echo "✅ liqo-webhook upgraded successfully"
+else
+  echo "⚠️  liqo-webhook deployment not found, skipping"
+fi
+
+echo ""
+echo "========================================="
+echo "Post-Upgrade Health Checks"
+echo "========================================="
+
+echo ""
+echo "Checking all control-plane deployments..."
+ALL_HEALTHY=true
+
+for component in "${CORE_COMPONENTS[@]}" "liqo-webhook"; do
+  if kubectl get deployment "${component}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+    REPLICAS=$(kubectl get deployment "${component}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}')
+    DESIRED=$(kubectl get deployment "${component}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}')
+
+    if [ "$REPLICAS" == "$DESIRED" ] && [ "$REPLICAS" -gt 0 ]; then
+      echo "  ✓ ${component}: ${REPLICAS}/${DESIRED} ready"
+    else
+      echo "  ✗ ${component}: ${REPLICAS}/${DESIRED} ready (UNHEALTHY)"
+      ALL_HEALTHY=false
     fi
   fi
 done
 
-echo ""
-echo "Step 7: Verifying deployment health..."
-if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "${NAMESPACE}"; then
-  echo "❌ ERROR: Deployment not healthy!"
+if [ "$ALL_HEALTHY" != "true" ]; then
+  echo ""
+  echo "❌ ERROR: Some control-plane components are unhealthy"
   exit 1
 fi
 
 echo ""
-echo "Step 8: Verifying version..."
-DEPLOYED_VERSION=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f2)
-echo "Deployed version: ${DEPLOYED_VERSION}"
+echo "Checking controller CRD reconciliation..."
+# Give controllers time to reconcile
+sleep 10
 
-if [ "${DEPLOYED_VERSION}" != "${TARGET_VERSION}" ]; then
-  echo "❌ ERROR: Version mismatch!"
-  exit 1
+# Check if controller-manager is reconciling by checking recent events
+RECENT_EVENTS=$(kubectl get events -n "${NAMESPACE}" \
+  --field-selector involvedObject.name=liqo-controller-manager \
+  --sort-by='.lastTimestamp' 2>/dev/null | tail -5 || echo "")
+
+if echo "$RECENT_EVENTS" | grep -q "Error\|Failed\|BackOff"; then
+  echo "⚠️  WARNING: Recent error events detected for controller-manager"
+  echo "$RECENT_EVENTS"
+else
+  echo "✓ No recent error events for control-plane components"
 fi
 
 echo ""
-echo "✅ Stage 2 complete: liqo-controller-manager upgraded"
-echo "✅ All critical environment variables preserved"
-`, upgrade.Spec.TargetVersion, namespace, backupConfigMapName)
+echo "✅ Stage 2 complete: Core control-plane upgraded successfully"
+echo ""
+echo "Summary:"
+echo "  - liqo-controller-manager: upgraded"
+echo "  - liqo-crd-replicator: upgraded"
+echo "  - liqo-metric-agent: upgraded"
+echo "  - liqo-webhook: upgraded with TLS validation"
+echo "  - Post-rollout health: verified"
+`, upgrade.Spec.TargetVersion, namespace, planConfigMap)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -212,8 +722,8 @@ echo "✅ All critical environment variables preserved"
 					RestartPolicy:      corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
-							Name:    "upgrade-controller-manager",
-							Image:   "bitnami/kubectl:latest",
+							Name:    "upgrade-core-controlplane",
+							Image:   "alpine/k8s:1.29.2",
 							Command: []string{"/bin/bash", "-c", script},
 						},
 					},

@@ -20,16 +20,15 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
 
@@ -66,6 +65,12 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 		return r.fail(ctx, upgrade, fmt.Sprintf("Cluster identity verification failed: %v", err))
 	}
 
+	// Step 1.5: Ensure liqo-cluster-id ConfigMap exists (auto-create if missing)
+	logger.Info("Step 1.5: Ensuring liqo-cluster-id ConfigMap exists")
+	if err := r.ensureClusterIDConfigMap(ctx, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to ensure liqo-cluster-id ConfigMap: %v", err))
+	}
+
 	// Step 2: Detect local cluster version from liqo-controller-manager image
 	logger.Info("Step 2: Detecting local cluster Liqo version")
 	localVersion, err := r.detectDeployedVersion(ctx, namespace)
@@ -99,11 +104,13 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 	}
 	logger.Info("Compatibility check passed", "from", minimumVersion, "to", upgrade.Spec.TargetVersion)
 
-	// Step 6: Backup critical environment variables and flags
-	logger.Info("Step 6: Backing up environment variables and configuration")
-	if err := r.backupEnvironmentConfig(ctx, upgrade, namespace); err != nil {
-		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to backup environment config: %v", err))
+	// Step 6: Load target version descriptor
+	logger.Info("Step 6: Loading target version descriptor")
+	targetDescriptor, err := r.loadTargetDescriptor(ctx, upgrade.Spec.TargetVersion, namespace)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to load target descriptor: %v", err))
 	}
+	logger.Info("Target descriptor loaded successfully", "version", targetDescriptor.Version, "components", len(targetDescriptor.Components))
 
 	// Step 7: Check component health
 	logger.Info("Step 7: Checking component health")
@@ -111,31 +118,43 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 		return r.fail(ctx, upgrade, fmt.Sprintf("Component health check failed: %v", err))
 	}
 
-	// Step 8: Save previous version (local version)
-	upgrade.Status.PreviousVersion = localVersion
+	// Step 8: Create live inventory and snapshot
+	logger.Info("Step 8: Creating live inventory snapshot")
+	snapshot, err := r.createLiveInventory(ctx, namespace, localVersion)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create live inventory: %v", err))
+	}
 
-	// Add Compatible condition
-	condition := metav1.Condition{
+	if err := r.createSnapshotConfigMap(ctx, upgrade, snapshot, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create snapshot ConfigMap: %v", err))
+	}
+
+	// Step 9: Build upgrade plan (compare snapshot vs target descriptor)
+	logger.Info("Step 9: Building upgrade plan")
+	plan, err := r.buildUpgradePlan(ctx, snapshot, targetDescriptor)
+	if err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to build upgrade plan: %v", err))
+	}
+
+	if err := r.createUpgradePlanConfigMap(ctx, upgrade, plan, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create upgrade plan ConfigMap: %v", err))
+	}
+	logger.Info("Upgrade plan created", "toCreate", len(plan.ToCreate), "toUpdate", len(plan.ToUpdate), "toDelete", len(plan.ToDelete))
+
+	// Step 10: Update status fields with validation results
+	// These must be persisted before transitioning to the next phase
+	upgrade.Status.PreviousVersion = localVersion
+	upgrade.Status.Conditions = []metav1.Condition{{
 		Type:               string(upgradev1alpha1.ConditionCompatible),
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: metav1.Now(),
 		Reason:             "ValidationPassed",
 		Message:            fmt.Sprintf("Minimum version %s → %s is compatible", minimumVersion, upgrade.Spec.TargetVersion),
-	}
+	}}
 
-	statusUpdates := map[string]interface{}{
-		"previousVersion": localVersion,
-		"conditions":      []metav1.Condition{condition},
-		"backupReady":     upgrade.Status.BackupReady,
-		"backupName":      upgrade.Status.BackupName,
-	}
-
-	if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseValidating, "Validation completed successfully", statusUpdates); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Move to next phase: Freeze operations
-	return r.startFreezeOperations(ctx, upgrade)
+	// Now start CRD upgrade - this will create the job AND update status to PhaseCRDs
+	// All the fields we set above will be included in the status update
+	return r.startCRDUpgrade(ctx, upgrade)
 }
 
 func (r *LiqoUpgradeReconciler) verifyClusterIdentity(ctx context.Context, namespace string) error {
@@ -146,6 +165,124 @@ func (r *LiqoUpgradeReconciler) verifyClusterIdentity(ctx context.Context, names
 		Namespace: namespace,
 	}, deployment)
 	return err
+}
+
+// ensureClusterIDConfigMap ensures the liqo-cluster-id ConfigMap exists
+// This integrates the logic from examples/setup-test-environment.sh
+func (r *LiqoUpgradeReconciler) ensureClusterIDConfigMap(ctx context.Context, namespace string) error {
+	logger := log.FromContext(ctx)
+
+	// Check if liqo-cluster-id ConfigMap already exists
+	clusterIDConfigMap := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      "liqo-cluster-id",
+		Namespace: namespace,
+	}, clusterIDConfigMap)
+
+	if err == nil {
+		// ConfigMap already exists
+		logger.Info("liqo-cluster-id ConfigMap already exists", "clusterID", clusterIDConfigMap.Data["CLUSTER_ID"])
+		return nil
+	}
+
+	// ConfigMap doesn't exist, extract CLUSTER_ID from liqo-controller-manager
+	logger.Info("liqo-cluster-id ConfigMap not found, creating it")
+
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      "liqo-controller-manager",
+		Namespace: namespace,
+	}, deployment); err != nil {
+		return fmt.Errorf("failed to get liqo-controller-manager deployment: %w", err)
+	}
+
+	// Extract CLUSTER_ID from environment variables
+	var clusterID string
+	if len(deployment.Spec.Template.Spec.Containers) > 0 {
+		container := deployment.Spec.Template.Spec.Containers[0]
+
+		// Try to find CLUSTER_ID in env vars
+		for _, env := range container.Env {
+			if env.Name == "CLUSTER_ID" {
+				if env.Value != "" {
+					clusterID = env.Value
+					logger.Info("Found CLUSTER_ID in env.value", "clusterID", clusterID)
+					break
+				} else if env.ValueFrom != nil && env.ValueFrom.ConfigMapKeyRef != nil {
+					// CLUSTER_ID is from a ConfigMap reference
+					refConfigMap := &corev1.ConfigMap{}
+					if err := r.Get(ctx, types.NamespacedName{
+						Name:      env.ValueFrom.ConfigMapKeyRef.Name,
+						Namespace: namespace,
+					}, refConfigMap); err == nil {
+						clusterID = refConfigMap.Data[env.ValueFrom.ConfigMapKeyRef.Key]
+						logger.Info("Found CLUSTER_ID from ConfigMap reference", "configMap", env.ValueFrom.ConfigMapKeyRef.Name, "clusterID", clusterID)
+						break
+					}
+				}
+			}
+		}
+
+		// If not found in env, try to extract from args
+		if clusterID == "" {
+			for _, arg := range container.Args {
+				if strings.HasPrefix(arg, "--cluster-id=") {
+					clusterID = strings.TrimPrefix(arg, "--cluster-id=")
+					// Remove $(CLUSTER_ID) variable reference if present
+					clusterID = strings.TrimPrefix(clusterID, "$(")
+					clusterID = strings.TrimSuffix(clusterID, ")")
+					if clusterID != "CLUSTER_ID" {
+						logger.Info("Found CLUSTER_ID in args", "clusterID", clusterID)
+						break
+					} else {
+						clusterID = ""
+					}
+				}
+			}
+		}
+	}
+
+	if clusterID == "" {
+		return fmt.Errorf("could not extract CLUSTER_ID from liqo-controller-manager deployment")
+	}
+
+	// Create the liqo-cluster-id ConfigMap
+	newConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "liqo-cluster-id",
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      "liqo",
+				"app.kubernetes.io/component": "liqo-upgrade-operator",
+			},
+		},
+		Data: map[string]string{
+			"CLUSTER_ID": clusterID,
+		},
+	}
+
+	if err := r.Create(ctx, newConfigMap); err != nil {
+		return fmt.Errorf("failed to create liqo-cluster-id ConfigMap: %w", err)
+	}
+
+	logger.Info("Created liqo-cluster-id ConfigMap", "clusterID", clusterID)
+
+	// Wait for ConfigMap to propagate to kubelet caches
+	// This prevents timing issues where pods start before the ConfigMap is available
+	logger.Info("Waiting for ConfigMap propagation...")
+	time.Sleep(5 * time.Second)
+
+	// Verify the ConfigMap is accessible
+	verifyConfigMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      "liqo-cluster-id",
+		Namespace: namespace,
+	}, verifyConfigMap); err != nil {
+		return fmt.Errorf("failed to verify liqo-cluster-id ConfigMap after creation: %w", err)
+	}
+
+	logger.Info("ConfigMap verified and ready", "clusterID", verifyConfigMap.Data["CLUSTER_ID"])
+	return nil
 }
 
 func (r *LiqoUpgradeReconciler) detectDeployedVersion(ctx context.Context, namespace string) (string, error) {
@@ -189,115 +326,6 @@ func (r *LiqoUpgradeReconciler) verifyComponentHealth(ctx context.Context, names
 	if deployment.Status.ReadyReplicas < 1 {
 		return fmt.Errorf("liqo-controller-manager not ready: %d/%d", deployment.Status.ReadyReplicas, *deployment.Spec.Replicas)
 	}
-
-	return nil
-}
-
-// backupEnvironmentConfig backs up critical environment variables and configuration
-func (r *LiqoUpgradeReconciler) backupEnvironmentConfig(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, namespace string) error {
-	logger := log.FromContext(ctx)
-
-	// Create a ConfigMap to store environment variable backups
-	backupConfigMapName := fmt.Sprintf("liqo-upgrade-env-backup-%s", upgrade.Name)
-
-	// Get liqo-controller-manager deployment
-	deployment := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      "liqo-controller-manager",
-		Namespace: namespace,
-	}, deployment)
-	if err != nil {
-		return fmt.Errorf("failed to get controller-manager deployment: %w", err)
-	}
-
-	// Extract environment variables from all containers
-	envData := make(map[string]string)
-	for _, container := range deployment.Spec.Template.Spec.Containers {
-		for _, env := range container.Env {
-			key := fmt.Sprintf("%s_%s", container.Name, env.Name)
-			if env.Value != "" {
-				envData[key] = env.Value
-			} else if env.ValueFrom != nil {
-				// Store reference info for ValueFrom
-				envData[key+"_type"] = "valueFrom"
-			}
-		}
-
-		// Store container args/command
-		if len(container.Args) > 0 {
-			envData[container.Name+"_args"] = strings.Join(container.Args, " ")
-		}
-		if len(container.Command) > 0 {
-			envData[container.Name+"_command"] = strings.Join(container.Command, " ")
-		}
-	}
-
-	// Critical environment variables that must be preserved (Stage 2)
-	criticalEnvVars := []string{
-		"POD_NAMESPACE",
-		"CLUSTER_ID",
-		"TENANT_NAMESPACE",
-		"CLUSTER_ROLE",
-		"ENABLE_IPAM",
-		"LOG_LEVEL",
-	}
-
-	// Verify critical env vars are present
-	for _, envVar := range criticalEnvVars {
-		found := false
-		for key := range envData {
-			if strings.Contains(key, envVar) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			logger.Info("Warning: critical environment variable not found in backup", "variable", envVar)
-		}
-	}
-
-	// Create backup ConfigMap
-	backupConfigMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      backupConfigMapName,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      "liqo-upgrade",
-				"app.kubernetes.io/component": "env-backup",
-				"upgrade.liqo.io/upgrade":     upgrade.Name,
-			},
-		},
-		Data: envData,
-	}
-
-	if err := controllerutil.SetControllerReference(upgrade, backupConfigMap, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	// Create or update the ConfigMap
-	existingConfigMap := &corev1.ConfigMap{}
-	err = r.Get(ctx, types.NamespacedName{Name: backupConfigMapName, Namespace: namespace}, existingConfigMap)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			if err := r.Create(ctx, backupConfigMap); err != nil {
-				return fmt.Errorf("failed to create backup ConfigMap: %w", err)
-			}
-			logger.Info("Environment config backup created", "configmap", backupConfigMapName)
-		} else {
-			return fmt.Errorf("failed to check backup ConfigMap: %w", err)
-		}
-	} else {
-		// Update existing
-		existingConfigMap.Data = envData
-		if err := r.Update(ctx, existingConfigMap); err != nil {
-			return fmt.Errorf("failed to update backup ConfigMap: %w", err)
-		}
-		logger.Info("Environment config backup updated", "configmap", backupConfigMapName)
-	}
-
-	// Store backup name in upgrade status for later use
-	upgrade.Status.BackupName = backupConfigMapName
-	upgrade.Status.BackupReady = true
 
 	return nil
 }

@@ -65,10 +65,6 @@ spec:
             type: object
           status:
             properties:
-              backupName:
-                type: string
-              backupReady:
-                type: boolean
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -136,10 +132,16 @@ spec:
                 type: string
               phase:
                 type: string
+              planConfigMap:
+                type: string
+              planReady:
+                type: boolean
               previousVersion:
                 type: string
               rolledBack:
                 type: boolean
+              snapshotConfigMap:
+                type: string
               totalStages:
                 type: integer
             type: object

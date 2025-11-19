@@ -17,7 +17,7 @@ rules:
 # Deployment permissions
 - apiGroups: ["apps"]
   resources: ["deployments"]
-  verbs: ["get", "list", "watch", "patch", "update"]
+  verbs: ["get", "list", "watch", "patch", "update", "delete"] # Added 'delete' verb
 
 # Deployment scale permissions (for scaling down controller-manager during gateway upgrades)
 - apiGroups: ["apps"]
@@ -47,7 +47,17 @@ rules:
 # Pod permissions
 - apiGroups: [""]
   resources: ["pods", "pods/log"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get", "list", "watch", "delete"]
+
+# Pod exec permissions (for network verification)
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+
+# Secret permissions (for gateway secret validation and RBAC regeneration)
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch", "delete"]
 
 # Namespace permissions (to discover liqo-tenant-* namespaces)
 - apiGroups: [""]
@@ -73,10 +83,35 @@ rules:
   resources: ["namespaceoffloadings"]
   verbs: ["get", "list", "watch"]
 
+# VirtualNode permissions (for virtual-kubelet upgrades)
+- apiGroups: ["offloading.liqo.io"]
+  resources: ["virtualnodes"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
+# VkOptionsTemplate permissions (for virtual-kubelet template upgrades)
+- apiGroups: ["offloading.liqo.io"]
+  resources: ["vkoptionstemplates"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
 # Liqo networking resources (for gateway upgrades)
 - apiGroups: ["networking.liqo.io"]
   resources: ["gateways", "connections", "gatewayclients", "gatewayservers", "wggatewayclients", "wggatewayservers", "wggatewayclienttemplates", "wggatewayservertemplates"]
   verbs: ["get", "list", "watch", "patch", "update", "delete"]
+
+# Liqo networking status subresources (required for status patching)
+- apiGroups: ["networking.liqo.io"]
+  resources: ["gatewayclients/status", "gatewayservers/status"]
+  verbs: ["get", "patch", "update"]
+
+# Liqo authentication resources (for RBAC regeneration)
+- apiGroups: ["authentication.liqo.io"]
+  resources: ["identities", "tenants"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
+# Liqo authentication status subresources (for accessing kubeconfig secret refs)
+- apiGroups: ["authentication.liqo.io"]
+  resources: ["identities/status"]
+  verbs: ["get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -22,8 +22,10 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -33,33 +35,89 @@ import (
 )
 
 // updateStatus updates the LiqoUpgrade status with the given phase and message
+// Uses retry logic to handle optimistic concurrency conflicts
 func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, phase upgradev1alpha1.UpgradePhase, message string, additionalUpdates map[string]interface{}) (ctrl.Result, error) {
-	upgrade.Status.Phase = phase
-	upgrade.Status.Message = message
-	upgrade.Status.LastUpdated = metav1.Now()
+	logger := log.FromContext(ctx)
 
-	if additionalUpdates != nil {
-		if previousVersion, ok := additionalUpdates["previousVersion"].(string); ok {
-			upgrade.Status.PreviousVersion = previousVersion
+	// Retry with exponential backoff on conflicts
+	err := wait.ExponentialBackoff(wait.Backoff{
+		Duration: 10 * time.Millisecond,
+		Factor:   2.0,
+		Steps:    5,
+		Cap:      1 * time.Second,
+	}, func() (bool, error) {
+		// Get a fresh copy of the resource
+		fresh := &upgradev1alpha1.LiqoUpgrade{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      upgrade.Name,
+			Namespace: upgrade.Namespace,
+		}, fresh); err != nil {
+			if errors.IsNotFound(err) {
+				// Resource was deleted, stop retrying
+				return true, err
+			}
+			// Temporary error, retry
+			return false, nil
 		}
-		if lastSuccessfulPhase, ok := additionalUpdates["lastSuccessfulPhase"].(upgradev1alpha1.UpgradePhase); ok {
-			upgrade.Status.LastSuccessfulPhase = lastSuccessfulPhase
-		}
-		if rolledBack, ok := additionalUpdates["rolledBack"].(bool); ok {
-			upgrade.Status.RolledBack = rolledBack
-		}
-		if conditions, ok := additionalUpdates["conditions"].([]metav1.Condition); ok {
-			upgrade.Status.Conditions = conditions
-		}
-		if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
-			upgrade.Status.BackupReady = backupReady
-		}
-		if backupName, ok := additionalUpdates["backupName"].(string); ok {
-			upgrade.Status.BackupName = backupName
-		}
-	}
 
-	if err := r.Status().Update(ctx, upgrade); err != nil {
+		// Apply status updates to the fresh copy
+		fresh.Status.Phase = phase
+		fresh.Status.Message = message
+		fresh.Status.LastUpdated = metav1.Now()
+
+		if additionalUpdates != nil {
+			if previousVersion, ok := additionalUpdates["previousVersion"].(string); ok {
+				fresh.Status.PreviousVersion = previousVersion
+			}
+			if lastSuccessfulPhase, ok := additionalUpdates["lastSuccessfulPhase"].(upgradev1alpha1.UpgradePhase); ok {
+				fresh.Status.LastSuccessfulPhase = lastSuccessfulPhase
+			}
+			if rolledBack, ok := additionalUpdates["rolledBack"].(bool); ok {
+				fresh.Status.RolledBack = rolledBack
+			}
+			if conditions, ok := additionalUpdates["conditions"].([]metav1.Condition); ok {
+				fresh.Status.Conditions = conditions
+			}
+			if snapshotConfigMap, ok := additionalUpdates["snapshotConfigMap"].(string); ok {
+				fresh.Status.SnapshotConfigMap = snapshotConfigMap
+			}
+			if planConfigMap, ok := additionalUpdates["planConfigMap"].(string); ok {
+				fresh.Status.PlanConfigMap = planConfigMap
+			}
+			if planReady, ok := additionalUpdates["planReady"].(bool); ok {
+				fresh.Status.PlanReady = planReady
+			}
+			if currentStage, ok := additionalUpdates["currentStage"].(int); ok {
+				fresh.Status.CurrentStage = currentStage
+			}
+			// Note: BackupReady and BackupName fields are planned for future implementation
+			// if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
+			// 	fresh.Status.BackupReady = backupReady
+			// }
+			// if backupName, ok := additionalUpdates["backupName"].(string); ok {
+			// 	fresh.Status.BackupName = backupName
+			// }
+		}
+
+		// Attempt the status update
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			if errors.IsConflict(err) {
+				// Conflict detected, retry with a fresh copy
+				logger.V(1).Info("Conflict detected during status update, retrying...")
+				return false, nil
+			}
+			// Other error, stop retrying
+			return true, err
+		}
+
+		// Success, update the reference to the fresh copy
+		upgrade.Status = fresh.Status
+		upgrade.ResourceVersion = fresh.ResourceVersion
+		return true, nil
+	})
+
+	if err != nil {
+		logger.Error(err, "Failed to update status after retries")
 		return ctrl.Result{}, err
 	}
 
@@ -77,7 +135,7 @@ func (r *LiqoUpgradeReconciler) handleDeletion(ctx context.Context, upgrade *upg
 
 	if controllerutil.ContainsFinalizer(upgrade, finalizerName) {
 		// Clean up jobs
-		jobPrefixes := []string{freezeOperationsJobPrefix, crdUpgradeJobPrefix, controllerManagerUpgradePrefix, networkFabricUpgradePrefix, rollbackJobPrefix}
+		jobPrefixes := []string{crdUpgradeJobPrefix, controllerManagerUpgradePrefix, networkFabricUpgradePrefix, rollbackJobPrefix}
 		for _, prefix := range jobPrefixes {
 			jobName := fmt.Sprintf("%s-%s", prefix, upgrade.Name)
 			job := &batchv1.Job{}
@@ -101,4 +159,60 @@ func (r *LiqoUpgradeReconciler) handleDeletion(ctx context.Context, upgrade *upg
 // int32Ptr returns a pointer to an int32
 func int32Ptr(i int32) *int32 {
 	return &i
+}
+
+// updateStatusCondition updates a condition in the LiqoUpgrade status with retry logic
+func (r *LiqoUpgradeReconciler) updateStatusCondition(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, condition metav1.Condition) error {
+	logger := log.FromContext(ctx)
+
+	// Retry with exponential backoff on conflicts
+	return wait.ExponentialBackoff(wait.Backoff{
+		Duration: 10 * time.Millisecond,
+		Factor:   2.0,
+		Steps:    5,
+		Cap:      1 * time.Second,
+	}, func() (bool, error) {
+		// Get a fresh copy of the resource
+		fresh := &upgradev1alpha1.LiqoUpgrade{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      upgrade.Name,
+			Namespace: upgrade.Namespace,
+		}, fresh); err != nil {
+			if errors.IsNotFound(err) {
+				// Resource was deleted, stop retrying
+				return true, err
+			}
+			// Temporary error, retry
+			return false, nil
+		}
+
+		// Find and update or append condition in the fresh copy
+		found := false
+		for i, c := range fresh.Status.Conditions {
+			if c.Type == condition.Type {
+				fresh.Status.Conditions[i] = condition
+				found = true
+				break
+			}
+		}
+		if !found {
+			fresh.Status.Conditions = append(fresh.Status.Conditions, condition)
+		}
+
+		// Attempt the status update
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			if errors.IsConflict(err) {
+				// Conflict detected, retry with a fresh copy
+				logger.V(1).Info("Conflict detected during condition update, retrying...")
+				return false, nil
+			}
+			// Other error, stop retrying
+			return true, err
+		}
+
+		// Success, update the reference to the fresh copy
+		upgrade.Status = fresh.Status
+		upgrade.ResourceVersion = fresh.ResourceVersion
+		return true, nil
+	})
 }
