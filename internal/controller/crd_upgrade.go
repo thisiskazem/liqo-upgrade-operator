@@ -53,7 +53,17 @@ func (r *LiqoUpgradeReconciler) startCRDUpgrade(ctx context.Context, upgrade *up
 		}
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "Upgrading CRDs", nil)
+	// Preserve any status fields that were set before calling this function
+	// (e.g., previousVersion, conditions, snapshotConfigMap from validation phase)
+	statusUpdates := map[string]interface{}{
+		"previousVersion":   upgrade.Status.PreviousVersion,
+		"conditions":        upgrade.Status.Conditions,
+		"snapshotConfigMap": upgrade.Status.SnapshotConfigMap,
+		"planConfigMap":     upgrade.Status.PlanConfigMap,
+		"planReady":         upgrade.Status.PlanReady,
+	}
+
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "Upgrading CRDs", statusUpdates)
 }
 
 func (r *LiqoUpgradeReconciler) monitorCRDUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
