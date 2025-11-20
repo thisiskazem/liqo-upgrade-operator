@@ -237,7 +237,7 @@ upgrade_component() {
             FIELD_PATH=$(echo "$NEW_VALUE")
             echo "  ${TYPE}: ${NAME} from fieldRef: ${FIELD_PATH}"
             ENV_VAR=$(jq -n --arg name "$NAME" --arg fieldPath "$FIELD_PATH" \
-              '{name: $name, valueFrom: {fieldRef: {fieldPath: $fieldPath}}}')
+              '{name: $name, valueFrom: {fieldRef: {apiVersion: "v1", fieldPath: $fieldPath}}}')
           else
             echo "  ⚠️  WARNING: Unknown source type for ${NAME}: ${NEW_SOURCE}, skipping"
             continue
