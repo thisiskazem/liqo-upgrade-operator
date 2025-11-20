@@ -141,6 +141,106 @@ fi
 echo "Upgrade plan loaded"
 echo ""
 
+# Validate prerequisites (ConfigMaps and Secrets referenced in env vars)
+echo "========================================="
+echo "Validating Prerequisites"
+echo "========================================="
+echo ""
+
+VALIDATION_FAILED=false
+
+# Check all components in the upgrade plan
+echo "Checking ConfigMaps and Secrets referenced in environment variables..."
+for COMPONENT_NAME in $(echo "$PLAN_JSON" | jq -r '.toUpdate[].name'); do
+  COMPONENT_PLAN=$(echo "$PLAN_JSON" | jq -r --arg name "$COMPONENT_NAME" '
+    .toUpdate[] | select(.name == $name)
+  ')
+
+  ENV_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.envChanges // []')
+  ENV_COUNT=$(echo "$ENV_CHANGES" | jq 'length')
+
+  if [ "$ENV_COUNT" -gt 0 ]; then
+    echo ""
+    echo "Validating ${COMPONENT_NAME} environment variable references..."
+
+    while IFS= read -r change; do
+      TYPE=$(echo "$change" | jq -r '.type')
+      NAME=$(echo "$change" | jq -r '.name')
+      NEW_SOURCE=$(echo "$change" | jq -r '.newSource // ""')
+      NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+
+      # Only validate add/update operations
+      if [ "$TYPE" == "add" ] || [ "$TYPE" == "update" ]; then
+        # Check ConfigMapKeyRef
+        if [[ "$NEW_SOURCE" == configMap:* ]]; then
+          CONFIGMAP_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+          KEY=$(echo "$NEW_VALUE")
+
+          echo -n "  Checking ConfigMap ${CONFIGMAP_NAME} (key: ${KEY})... "
+
+          if ! kubectl get configmap "${CONFIGMAP_NAME}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+            echo "❌ NOT FOUND"
+            echo "    ERROR: ConfigMap '${CONFIGMAP_NAME}' does not exist in namespace '${NAMESPACE}'"
+            echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+            VALIDATION_FAILED=true
+          else
+            # Check if the key exists in the ConfigMap
+            if ! kubectl get configmap "${CONFIGMAP_NAME}" -n "${NAMESPACE}" -o jsonpath="{.data.${KEY}}" > /dev/null 2>&1; then
+              echo "❌ KEY NOT FOUND"
+              echo "    ERROR: ConfigMap '${CONFIGMAP_NAME}' exists but does not contain key '${KEY}'"
+              echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+              VALIDATION_FAILED=true
+            else
+              echo "✓ OK"
+            fi
+          fi
+
+        # Check SecretKeyRef
+        elif [[ "$NEW_SOURCE" == secret:* ]]; then
+          SECRET_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+          KEY=$(echo "$NEW_VALUE")
+
+          echo -n "  Checking Secret ${SECRET_NAME} (key: ${KEY})... "
+
+          if ! kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+            echo "❌ NOT FOUND"
+            echo "    ERROR: Secret '${SECRET_NAME}' does not exist in namespace '${NAMESPACE}'"
+            echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+            VALIDATION_FAILED=true
+          else
+            # Check if the key exists in the Secret
+            if ! kubectl get secret "${SECRET_NAME}" -n "${NAMESPACE}" -o jsonpath="{.data.${KEY}}" > /dev/null 2>&1; then
+              echo "❌ KEY NOT FOUND"
+              echo "    ERROR: Secret '${SECRET_NAME}' exists but does not contain key '${KEY}'"
+              echo "    Required by: ${COMPONENT_NAME} environment variable '${NAME}'"
+              VALIDATION_FAILED=true
+            else
+              echo "✓ OK"
+            fi
+          fi
+        fi
+      fi
+    done < <(echo "$ENV_CHANGES" | jq -c '.[]')
+  fi
+done
+
+echo ""
+if [ "$VALIDATION_FAILED" == "true" ]; then
+  echo "❌ ERROR: Prerequisite validation failed!"
+  echo ""
+  echo "The upgrade cannot proceed because required ConfigMaps or Secrets are missing."
+  echo "Please ensure all required resources exist before retrying the upgrade."
+  echo ""
+  echo "Troubleshooting:"
+  echo "  1. Check if Liqo is properly installed with all required resources"
+  echo "  2. Verify that ConfigMaps and Secrets have not been accidentally deleted"
+  echo "  3. Ensure you are targeting the correct namespace"
+  exit 1
+fi
+
+echo "✅ All prerequisites validated successfully"
+echo ""
+
 # Core control-plane components to upgrade (in order)
 CORE_COMPONENTS=("liqo-controller-manager" "liqo-crd-replicator" "liqo-metric-agent")
 
