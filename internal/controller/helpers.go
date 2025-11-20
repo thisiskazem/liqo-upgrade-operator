@@ -78,6 +78,15 @@ func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgra
 			if conditions, ok := additionalUpdates["conditions"].([]metav1.Condition); ok {
 				fresh.Status.Conditions = conditions
 			}
+			if snapshotConfigMap, ok := additionalUpdates["snapshotConfigMap"].(string); ok {
+				fresh.Status.SnapshotConfigMap = snapshotConfigMap
+			}
+			if planConfigMap, ok := additionalUpdates["planConfigMap"].(string); ok {
+				fresh.Status.PlanConfigMap = planConfigMap
+			}
+			if planReady, ok := additionalUpdates["planReady"].(bool); ok {
+				fresh.Status.PlanReady = planReady
+			}
 			// Note: BackupReady and BackupName fields are planned for future implementation
 			// if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
 			// 	fresh.Status.BackupReady = backupReady

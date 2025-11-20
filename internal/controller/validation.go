@@ -135,10 +135,6 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 	logger.Info("Upgrade plan created", "toCreate", len(plan.ToCreate), "toUpdate", len(plan.ToUpdate), "toDelete", len(plan.ToDelete))
 
 	// Step 10: Save previous version and add Compatible condition
-	// Note: We update status fields here but don't transition phase yet
-	// The phase transition to PhaseCRDs happens in startCRDUpgrade()
-	upgrade.Status.PreviousVersion = localVersion
-
 	condition := metav1.Condition{
 		Type:               string(upgradev1alpha1.ConditionCompatible),
 		Status:             metav1.ConditionTrue,
@@ -146,11 +142,18 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 		Reason:             "ValidationPassed",
 		Message:            fmt.Sprintf("Minimum version %s → %s is compatible", minimumVersion, upgrade.Spec.TargetVersion),
 	}
-	upgrade.Status.Conditions = []metav1.Condition{condition}
 
-	// Move to next phase: CRD Upgrade
-	// This will update the status to PhaseCRDs
-	return r.startCRDUpgrade(ctx, upgrade)
+	// Update status with all validation results and transition to CRD upgrade phase
+	// This persists all fields before the next reconciliation loop handles the CRD upgrade
+	statusUpdates := map[string]interface{}{
+		"previousVersion":   localVersion,
+		"snapshotConfigMap": upgrade.Status.SnapshotConfigMap,
+		"planConfigMap":     upgrade.Status.PlanConfigMap,
+		"planReady":         upgrade.Status.PlanReady,
+		"conditions":        []metav1.Condition{condition},
+	}
+
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "Starting CRD upgrade", statusUpdates)
 }
 
 func (r *LiqoUpgradeReconciler) verifyClusterIdentity(ctx context.Context, namespace string) error {
