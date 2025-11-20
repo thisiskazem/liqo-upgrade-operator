@@ -152,11 +152,12 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 		"conditions":        []metav1.Condition{condition},
 	}
 
-	if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseValidating, "Validation completed successfully", statusUpdates); err != nil {
-		return ctrl.Result{}, err
-	}
+	// Update status fields but don't transition phase yet
+	upgrade.Status.PreviousVersion = localVersion
+	upgrade.Status.Conditions = []metav1.Condition{condition}
 
 	// Move to next phase: CRD Upgrade
+	// This will update the status to PhaseCRDs
 	return r.startCRDUpgrade(ctx, upgrade)
 }
 
