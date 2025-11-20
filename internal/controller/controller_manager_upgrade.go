@@ -199,26 +199,83 @@ upgrade_component() {
       echo ""
       echo "Step 2: Applying ${ENV_COUNT} environment variable change(s)..."
 
-      # Build env patch
-      ENV_PATCH='[]'
+      # Get current env array
+      CURRENT_ENV=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" -o json | \
+        jq '.spec.template.spec.containers[] | select(.name == "'${CONTAINER_NAME}'") | .env // []')
+
+      # Process each env change and build new env array
+      NEW_ENV="$CURRENT_ENV"
       while IFS= read -r change; do
         TYPE=$(echo "$change" | jq -r '.type')
         NAME=$(echo "$change" | jq -r '.name')
         NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+        NEW_SOURCE=$(echo "$change" | jq -r '.newSource // ""')
 
         if [ "$TYPE" == "add" ] || [ "$TYPE" == "update" ]; then
-          echo "  ${TYPE}: ${NAME}=${NEW_VALUE}"
-          ENV_PATCH=$(echo "$ENV_PATCH" | jq --arg n "$NAME" --arg v "$NEW_VALUE" '. += [{"name": $n, "value": $v}]')
+          # Determine the source type and build appropriate env var
+          if [ "$NEW_SOURCE" == "value" ]; then
+            # Simple value-based env var
+            echo "  ${TYPE}: ${NAME}=${NEW_VALUE}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg value "$NEW_VALUE" \
+              '{name: $name, value: $value}')
+          elif [[ "$NEW_SOURCE" == configMap:* ]]; then
+            # ConfigMapKeyRef
+            CONFIGMAP_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+            KEY=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from ConfigMap ${CONFIGMAP_NAME}, key: ${KEY}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg cmName "$CONFIGMAP_NAME" --arg key "$KEY" \
+              '{name: $name, valueFrom: {configMapKeyRef: {name: $cmName, key: $key}}}')
+          elif [[ "$NEW_SOURCE" == secret:* ]]; then
+            # SecretKeyRef
+            SECRET_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+            KEY=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from Secret ${SECRET_NAME}, key: ${KEY}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg secretName "$SECRET_NAME" --arg key "$KEY" \
+              '{name: $name, valueFrom: {secretKeyRef: {name: $secretName, key: $key}}}')
+          elif [ "$NEW_SOURCE" == "fieldRef" ]; then
+            # FieldRef (e.g., metadata.namespace)
+            FIELD_PATH=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from fieldRef: ${FIELD_PATH}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg fieldPath "$FIELD_PATH" \
+              '{name: $name, valueFrom: {fieldRef: {fieldPath: $fieldPath}}}')
+          else
+            echo "  ⚠️  WARNING: Unknown source type for ${NAME}: ${NEW_SOURCE}, skipping"
+            continue
+          fi
+
+          # Update or add the env var in the array
+          if echo "$NEW_ENV" | jq -e --arg name "$NAME" 'any(.[]; .name == $name)' > /dev/null; then
+            # Update existing
+            NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" --arg name "$NAME" \
+              'map(if .name == $name then $envVar else . end)')
+          else
+            # Add new
+            NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" '. += [$envVar]')
+          fi
         elif [ "$TYPE" == "remove" ]; then
           echo "  ${TYPE}: ${NAME}"
-          # For remove, we need to patch with $patch: delete
+          NEW_ENV=$(echo "$NEW_ENV" | jq --arg name "$NAME" 'map(select(.name != $name))')
         fi
       done < <(echo "$ENV_CHANGES" | jq -c '.[]')
 
-      # Apply env patch if we have additions/updates
-      if [ "$(echo "$ENV_PATCH" | jq 'length')" -gt 0 ]; then
-        kubectl set env deployment/"${COMPONENT_NAME}" -n "${NAMESPACE}" \
-          $(echo "$ENV_PATCH" | jq -r '.[] | "--env=\(.name)=\(.value)"' | tr '\n' ' ')
+      # Apply the complete env array patch
+      if [ "$ENV_COUNT" -gt 0 ]; then
+        PATCH=$(cat <<EOF
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "${CONTAINER_NAME}",
+          "env": ${NEW_ENV}
+        }]
+      }
+    }
+  }
+}
+EOF
+)
+        kubectl patch deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" --type=strategic --patch "$PATCH"
       fi
     else
       echo ""

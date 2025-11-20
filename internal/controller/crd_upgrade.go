@@ -564,21 +564,8 @@ func (r *LiqoUpgradeReconciler) analyzeCRDChanges(ctx context.Context, upgrade *
 			ObservedGeneration: upgrade.Generation,
 		}
 
-		// Find and update or append condition
-		found := false
-		for i, c := range upgrade.Status.Conditions {
-			if c.Type == string(upgradev1alpha1.ConditionCRDWarnings) {
-				upgrade.Status.Conditions[i] = condition
-				found = true
-				break
-			}
-		}
-		if !found {
-			upgrade.Status.Conditions = append(upgrade.Status.Conditions, condition)
-		}
-
-		// Update status
-		if err := r.Status().Update(ctx, upgrade); err != nil {
+		// Update status with retry logic
+		if err := r.updateStatusCondition(ctx, upgrade, condition); err != nil {
 			return fmt.Errorf("failed to update CRD warnings condition: %w", err)
 		}
 
@@ -594,19 +581,8 @@ func (r *LiqoUpgradeReconciler) analyzeCRDChanges(ctx context.Context, upgrade *
 			ObservedGeneration: upgrade.Generation,
 		}
 
-		found := false
-		for i, c := range upgrade.Status.Conditions {
-			if c.Type == string(upgradev1alpha1.ConditionCRDWarnings) {
-				upgrade.Status.Conditions[i] = condition
-				found = true
-				break
-			}
-		}
-		if !found {
-			upgrade.Status.Conditions = append(upgrade.Status.Conditions, condition)
-		}
-
-		if err := r.Status().Update(ctx, upgrade); err != nil {
+		// Update status with retry logic
+		if err := r.updateStatusCondition(ctx, upgrade, condition); err != nil {
 			return fmt.Errorf("failed to update CRD warnings condition: %w", err)
 		}
 	}
