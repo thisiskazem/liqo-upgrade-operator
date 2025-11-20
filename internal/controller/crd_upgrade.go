@@ -84,12 +84,9 @@ func (r *LiqoUpgradeReconciler) monitorCRDUpgrade(ctx context.Context, upgrade *
 			logger.Error(err, "Failed to analyze CRD changes", "note", "non-fatal error, continuing")
 		}
 
-		statusUpdates := map[string]interface{}{
-			"lastSuccessfulPhase": upgradev1alpha1.PhaseCRDs,
-		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCRDs, "CRDs upgraded", statusUpdates); err != nil {
-			return ctrl.Result{}, err
-		}
+		// Update lastSuccessfulPhase before transitioning to next phase
+		// This must be done in the startControllerManagerUpgrade call to avoid race conditions
+		upgrade.Status.LastSuccessfulPhase = upgradev1alpha1.PhaseCRDs
 		return r.startControllerManagerUpgrade(ctx, upgrade)
 	}
 

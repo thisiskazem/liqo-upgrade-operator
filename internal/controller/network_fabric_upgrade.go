@@ -38,8 +38,6 @@ func (r *LiqoUpgradeReconciler) startNetworkFabricUpgrade(ctx context.Context, u
 	logger := log.FromContext(ctx)
 	logger.Info("Stage 3: Starting network fabric upgrade")
 
-	upgrade.Status.CurrentStage = 3
-
 	job := r.buildNetworkFabricUpgradeJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
 		return ctrl.Result{}, err
@@ -52,7 +50,12 @@ func (r *LiqoUpgradeReconciler) startNetworkFabricUpgrade(ctx context.Context, u
 		}
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseNetworkFabric, "Upgrading network fabric components", nil)
+	// Pass all status updates in additionalUpdates map to ensure they are persisted
+	statusUpdates := map[string]interface{}{
+		"currentStage":        3,
+		"lastSuccessfulPhase": upgrade.Status.LastSuccessfulPhase,
+	}
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseNetworkFabric, "Upgrading network fabric components", statusUpdates)
 }
 
 func (r *LiqoUpgradeReconciler) monitorNetworkFabricUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
@@ -67,12 +70,9 @@ func (r *LiqoUpgradeReconciler) monitorNetworkFabricUpgrade(ctx context.Context,
 
 	if job.Status.Succeeded > 0 {
 		logger.Info("Stage 3 completed: Network fabric upgraded successfully")
-		statusUpdates := map[string]interface{}{
-			"lastSuccessfulPhase": upgradev1alpha1.PhaseNetworkFabric,
-		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseNetworkFabric, "Network fabric upgraded", statusUpdates); err != nil {
-			return ctrl.Result{}, err
-		}
+		// Update lastSuccessfulPhase before transitioning to next phase
+		// This must be done in the startVerification call to avoid race conditions
+		upgrade.Status.LastSuccessfulPhase = upgradev1alpha1.PhaseNetworkFabric
 		return r.startVerification(ctx, upgrade)
 	}
 

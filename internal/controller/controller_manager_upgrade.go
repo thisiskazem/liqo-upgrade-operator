@@ -46,8 +46,6 @@ func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Contex
 	logger := log.FromContext(ctx)
 	logger.Info("Stage 2: Starting core control-plane upgrade")
 
-	upgrade.Status.CurrentStage = 2
-
 	job := r.buildControllerManagerUpgradeJob(upgrade)
 	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
 		return ctrl.Result{}, err
@@ -60,7 +58,12 @@ func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Contex
 		}
 	}
 
-	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Upgrading core control-plane components", nil)
+	// Pass all status updates in additionalUpdates map to ensure they are persisted
+	statusUpdates := map[string]interface{}{
+		"currentStage":        2,
+		"lastSuccessfulPhase": upgrade.Status.LastSuccessfulPhase,
+	}
+	return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Upgrading core control-plane components", statusUpdates)
 }
 
 func (r *LiqoUpgradeReconciler) monitorControllerManagerUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {

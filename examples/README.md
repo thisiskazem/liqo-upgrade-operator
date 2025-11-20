@@ -28,7 +28,7 @@ make deploy IMG=<your-registry>/liqo-upgrade-controller:<tag>
 
 ### 2. Set Up Test Environment
 
-The setup script will automatically detect your Liqo installation and create the necessary ConfigMaps:
+**IMPORTANT**: You MUST run this setup script before testing the upgrade operator. It creates required ConfigMaps.
 
 ```bash
 cd examples
@@ -38,8 +38,10 @@ cd examples
 This script will:
 - Verify Liqo is installed
 - Extract the CLUSTER_ID from your liqo-controller-manager deployment
-- Create the `liqo-cluster-id` ConfigMap if it doesn't exist
+- Create the `liqo-cluster-id` ConfigMap (required for upgrades)
 - Verify all required ConfigMaps are present
+
+**Why is this needed?** The upgrade process validates that all ConfigMaps and Secrets referenced by environment variables exist before applying changes. Without the `liqo-cluster-id` ConfigMap, the controller-manager upgrade will fail during prerequisites validation.
 
 ### 3. Run a Test Upgrade
 
@@ -89,14 +91,25 @@ If you see this error, run the setup script:
 
 The script will automatically create the missing ConfigMap.
 
-### Phase Cycling Between Validating and UpgradingCRDs
+### Phase Cycling Between UpgradingCRDs and UpgradingControllerManager
 
-This was a bug that has been fixed. Ensure you're running the latest version of the operator. If the issue persists:
+**This bug has been fixed in the latest version.** The issue was caused by race conditions during phase transitions.
 
-1. Delete the existing upgrade resource
-2. Rebuild and redeploy the operator
-3. Run the setup script again
-4. Create a new upgrade resource
+If you encounter this issue:
+
+1. Delete the existing upgrade resource:
+   ```bash
+   kubectl delete liqoupgrades.upgrade.liqo.io liqo-upgrade-test -n liqo
+   ```
+2. Rebuild and redeploy the operator with the latest code
+3. Ensure the setup script has been run:
+   ```bash
+   ./setup-test-environment.sh
+   ```
+4. Create a new upgrade resource:
+   ```bash
+   kubectl apply -f test-upgrade.yaml
+   ```
 
 ### Upgrade Fails During Prerequisites Validation
 

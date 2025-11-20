@@ -87,6 +87,9 @@ func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgra
 			if planReady, ok := additionalUpdates["planReady"].(bool); ok {
 				fresh.Status.PlanReady = planReady
 			}
+			if currentStage, ok := additionalUpdates["currentStage"].(int); ok {
+				fresh.Status.CurrentStage = currentStage
+			}
 			// Note: BackupReady and BackupName fields are planned for future implementation
 			// if backupReady, ok := additionalUpdates["backupReady"].(bool); ok {
 			// 	fresh.Status.BackupReady = backupReady
