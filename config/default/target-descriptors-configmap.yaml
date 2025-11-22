@@ -214,8 +214,17 @@ data:
             "repository": "ghcr.io/liqotech/crd-replicator",
             "tag": "v1.0.1"
           },
-          "args": [],
-          "env": []
+          "args": [
+            "--cluster-id=$(CLUSTER_ID)"
+          ],
+          "env": [
+            {
+              "name": "CLUSTER_ID",
+              "type": "configMapKeyRef",
+              "configMapName": "liqo-cluster-id",
+              "key": "CLUSTER_ID"
+            }
+          ]
         },
         {
           "name": "liqo-webhook",
@@ -227,9 +236,38 @@ data:
             "tag": "v1.0.1"
           },
           "args": [
-            "--webhook-port=9443"
+            "--webhook-port=9443",
+            "--cluster-id=$(CLUSTER_ID)",
+            "--liqo-namespace=$(POD_NAMESPACE)",
+            "--secret-name=liqo-webhook-certs",
+            "--liqo-runtime-class=liqo",
+            "--podcidr=10.42.0.0/16",
+            "--vk-options-default-template=liqo/virtual-kubelet-default",
+            "--enable-resource-enforcement"
           ],
-          "env": []
+          "env": [
+            {
+              "name": "CLUSTER_ID",
+              "type": "configMapKeyRef",
+              "configMapName": "liqo-cluster-id",
+              "key": "CLUSTER_ID"
+            },
+            {
+              "name": "POD_NAME",
+              "type": "fieldRef",
+              "value": "metadata.name"
+            },
+            {
+              "name": "POD_NAMESPACE",
+              "type": "fieldRef",
+              "value": "metadata.namespace"
+            },
+            {
+              "name": "DEPLOYMENT_NAME",
+              "type": "value",
+              "value": "liqo-webhook"
+            }
+          ]
         },
         {
           "name": "liqo-ipam",
@@ -317,7 +355,10 @@ data:
             "repository": "ghcr.io/liqotech/metric-agent",
             "tag": "v1.0.1"
           },
-          "args": [],
+          "args": [
+            "--cert-path=/certs/cert.pem",
+            "--key-path=/certs/key.pem"
+          ],
           "env": []
         },
         {

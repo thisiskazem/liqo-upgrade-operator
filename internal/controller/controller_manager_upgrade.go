@@ -244,6 +244,43 @@ fi
 echo "✅ All prerequisites validated successfully"
 echo ""
 
+# Cleanup any crashlooping pods from previous failed upgrade attempts
+echo "========================================="
+echo "Cleaning Up Stale Pods"
+echo "========================================="
+echo ""
+
+echo "Checking for crashlooping pods in namespace ${NAMESPACE}..."
+
+# Get all pods in CrashLoopBackOff state
+CRASHLOOP_PODS=$(kubectl get pods -n "${NAMESPACE}" \
+  --field-selector=status.phase=Running \
+  -o json | jq -r '
+  .items[] |
+  select(.status.containerStatuses[]? | select(.state.waiting?.reason == "CrashLoopBackOff")) |
+  .metadata.name
+')
+
+if [ -n "$CRASHLOOP_PODS" ]; then
+  echo "Found crashlooping pods, cleaning up..."
+  echo "$CRASHLOOP_PODS" | while read -r pod; do
+    if [ -n "$pod" ]; then
+      echo "  Deleting crashlooping pod: $pod"
+      kubectl delete pod "$pod" -n "${NAMESPACE}" --wait=false
+    fi
+  done
+
+  # Wait a moment for deletions to process
+  echo ""
+  echo "Waiting for pod cleanup to complete..."
+  sleep 5
+  echo "✓ Pod cleanup complete"
+else
+  echo "No crashlooping pods found"
+fi
+
+echo ""
+
 # Core control-plane components to upgrade (in order)
 CORE_COMPONENTS=("liqo-controller-manager" "liqo-crd-replicator" "liqo-metric-agent")
 

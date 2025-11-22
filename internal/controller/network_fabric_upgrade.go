@@ -261,6 +261,97 @@ fi
 echo "✅ Gateway templates upgraded successfully"
 
 echo ""
+echo "Step 3.5: Upgrading Virtual Kubelet Template and VirtualNodes..."
+
+# Upgrade VkOptionsTemplate
+echo "--- Upgrading VkOptionsTemplate ---"
+if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/dev/null; then
+  echo "Updating VkOptionsTemplate to version ${TARGET_VERSION}..."
+
+  # Patch the template to update the virtual-kubelet container image
+  kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/containerImage", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
+    ]' && echo "  ✓ VkOptionsTemplate updated" || echo "  ⚠️  Warning: Could not update VkOptionsTemplate"
+else
+  echo "  ℹ️  VkOptionsTemplate not found, skipping"
+fi
+
+# Verify template was updated
+sleep 2
+echo "Verifying VkOptionsTemplate update..."
+VK_TEMPLATE_IMAGE=$(kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.containerImage}' 2>/dev/null || echo "not found")
+echo "  VkOptionsTemplate image: ${VK_TEMPLATE_IMAGE}"
+
+if [[ "$VK_TEMPLATE_IMAGE" != *"${TARGET_VERSION}"* ]] && [[ "$VK_TEMPLATE_IMAGE" != "not found" ]]; then
+  echo "❌ ERROR: VkOptionsTemplate not updated to ${TARGET_VERSION}!"
+  exit 1
+fi
+
+echo "✅ VkOptionsTemplate upgraded successfully"
+
+# Upgrade existing VirtualNode resources to use new image
+echo ""
+echo "--- Upgrading VirtualNode Resources ---"
+VIRTUALNODES=$(kubectl get virtualnodes -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+if [ -z "$VIRTUALNODES" ]; then
+  echo "  ℹ️  No VirtualNode resources found, skipping"
+else
+  VN_COUNT=0
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      VN_NAMESPACE=$(echo "$line" | awk '{print $1}')
+      VN_NAME=$(echo "$line" | awk '{print $2}')
+
+      echo "  Updating VirtualNode: ${VN_NAME} in namespace ${VN_NAMESPACE}..."
+
+      # Get current image
+      CURRENT_VK_IMAGE=$(kubectl get virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+
+      if [[ "$CURRENT_VK_IMAGE" != *"${TARGET_VERSION}"* ]]; then
+        # Patch VirtualNode to update virtual-kubelet image
+        kubectl patch virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
+          --type='json' -p='[
+            {"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
+          ]' && echo "    ✓ Updated from ${CURRENT_VK_IMAGE} to ${TARGET_VERSION}" || echo "    ⚠️  Warning: Could not update VirtualNode"
+
+        VN_COUNT=$((VN_COUNT + 1))
+      else
+        echo "    ℹ️  Already at ${TARGET_VERSION}, skipping"
+      fi
+    fi
+  done <<< "$VIRTUALNODES"
+
+  echo "✅ ${VN_COUNT} VirtualNode(s) upgraded"
+
+  # Wait for virtual-kubelet deployments to roll out
+  if [ "$VN_COUNT" -gt 0 ]; then
+    echo ""
+    echo "Waiting for virtual-kubelet deployments to update..."
+    sleep 10
+
+    # Check virtual-kubelet deployment health
+    VK_DEPLOYMENTS=$(kubectl get deployments -A -l offloading.liqo.io/component=virtual-kubelet \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+    if [ -n "$VK_DEPLOYMENTS" ]; then
+      while IFS= read -r line; do
+        if [ -n "$line" ]; then
+          VK_NS=$(echo "$line" | awk '{print $1}')
+          VK_DEPLOY=$(echo "$line" | awk '{print $2}')
+
+          echo "  Checking ${VK_DEPLOY} in ${VK_NS}..."
+          kubectl rollout status deployment/"$VK_DEPLOY" -n "$VK_NS" --timeout=2m || echo "    ⚠️  Warning: Rollout status check failed"
+        fi
+      done <<< "$VK_DEPLOYMENTS"
+    fi
+  fi
+fi
+
+echo ""
 echo "Step 4: Upgrading network components sequentially with health checks..."
 
 # Function to check component health
