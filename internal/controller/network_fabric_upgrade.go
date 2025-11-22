@@ -300,51 +300,120 @@ if [ -z "$VIRTUALNODES" ]; then
   echo "  ℹ️  No VirtualNode resources found, skipping"
 else
   VN_COUNT=0
+  VK_DEPLOYMENTS_TO_DELETE=""
+
   while IFS= read -r line; do
     if [ -n "$line" ]; then
       VN_NAMESPACE=$(echo "$line" | awk '{print $1}')
       VN_NAME=$(echo "$line" | awk '{print $2}')
 
-      echo "  Updating VirtualNode: ${VN_NAME} in namespace ${VN_NAMESPACE}..."
+      echo "  Processing VirtualNode: ${VN_NAME} in namespace ${VN_NAMESPACE}..."
 
-      # Get current image
-      CURRENT_VK_IMAGE=$(kubectl get virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
-        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+      # Check current VirtualNode image (note: double-nested template structure)
+      CURRENT_VN_IMAGE=$(kubectl get virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+      echo "    Current VirtualNode image: ${CURRENT_VN_IMAGE}"
 
-      if [[ "$CURRENT_VK_IMAGE" != *"${TARGET_VERSION}"* ]]; then
-        # Patch VirtualNode to update virtual-kubelet image
+      if [[ "$CURRENT_VN_IMAGE" != *"${TARGET_VERSION}"* ]]; then
+        # Patch VirtualNode to update the container image (note: path has template/spec/template/spec)
+        echo "    Patching VirtualNode to update image to ${TARGET_VERSION}..."
         kubectl patch virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
           --type='json' -p='[
-            {"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
-          ]' && echo "    ✓ Updated from ${CURRENT_VK_IMAGE} to ${TARGET_VERSION}" || echo "    ⚠️  Warning: Could not update VirtualNode"
+            {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
+          ]' && echo "    ✓ VirtualNode image updated" || echo "    ⚠️  Warning: Could not update VirtualNode"
 
-        VN_COUNT=$((VN_COUNT + 1))
+        # Find the corresponding virtual-kubelet deployment
+        VK_DEPLOY=$(kubectl get deployments -n "$VN_NAMESPACE" -l "liqo.io/virtual-node=${VN_NAME}" \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
+          kubectl get deployments -n "$VN_NAMESPACE" -l "offloading.liqo.io/component=virtual-kubelet,liqo.io/remote-cluster-id=${VN_NAME}" \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+        if [ -n "$VK_DEPLOY" ]; then
+          echo "    Found deployment: ${VK_DEPLOY}"
+
+          # Delete the deployment to force recreation from updated VirtualNode spec
+          echo "    Deleting deployment to force recreation with new image..."
+          kubectl delete deployment "$VK_DEPLOY" -n "$VN_NAMESPACE" --wait=false 2>/dev/null || true
+          VK_DEPLOYMENTS_TO_DELETE="${VK_DEPLOYMENTS_TO_DELETE}${VN_NAMESPACE} ${VK_DEPLOY}\n"
+          VN_COUNT=$((VN_COUNT + 1))
+        else
+          echo "    ⚠️  Warning: Could not find virtual-kubelet deployment for ${VN_NAME}"
+        fi
       else
         echo "    ℹ️  Already at ${TARGET_VERSION}, skipping"
       fi
     fi
   done <<< "$VIRTUALNODES"
 
-  echo "✅ ${VN_COUNT} VirtualNode(s) upgraded"
+  echo "✅ ${VN_COUNT} VirtualNode(s) processed for upgrade"
 
-  # Wait for virtual-kubelet deployments to roll out
+  # Wait for virtual-kubelet deployments to be recreated and roll out
   if [ "$VN_COUNT" -gt 0 ]; then
     echo ""
-    echo "Waiting for virtual-kubelet deployments to update..."
-    sleep 10
+    echo "Waiting for Liqo controller to recreate virtual-kubelet deployments from updated templates..."
+    sleep 15
+
+    # Wait for deployments to be recreated
+    echo "Waiting for deployments to be recreated..."
+    TIMEOUT=120
+    ELAPSED=0
+    while [ $ELAPSED -lt $TIMEOUT ]; do
+      ALL_RECREATED=true
+
+      # Check each deleted deployment
+      while IFS= read -r line; do
+        if [ -n "$line" ]; then
+          VK_NS=$(echo "$line" | awk '{print $1}')
+          VK_DEPLOY=$(echo "$line" | awk '{print $2}')
+
+          if ! kubectl get deployment "$VK_DEPLOY" -n "$VK_NS" &>/dev/null; then
+            ALL_RECREATED=false
+            break
+          fi
+        fi
+      done <<< "$(echo -e "$VK_DEPLOYMENTS_TO_DELETE")"
+
+      if [ "$ALL_RECREATED" = true ]; then
+        echo "  ✓ All virtual-kubelet deployments recreated"
+        break
+      fi
+
+      sleep 5
+      ELAPSED=$((ELAPSED + 5))
+    done
+
+    if [ $ELAPSED -ge $TIMEOUT ]; then
+      echo "  ⚠️  Warning: Some deployments not recreated within timeout"
+    fi
 
     # Check virtual-kubelet deployment health
+    sleep 5
     VK_DEPLOYMENTS=$(kubectl get deployments -A -l offloading.liqo.io/component=virtual-kubelet \
       -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
 
     if [ -n "$VK_DEPLOYMENTS" ]; then
+      echo "Waiting for virtual-kubelet deployments to roll out..."
       while IFS= read -r line; do
         if [ -n "$line" ]; then
           VK_NS=$(echo "$line" | awk '{print $1}')
           VK_DEPLOY=$(echo "$line" | awk '{print $2}')
 
           echo "  Checking ${VK_DEPLOY} in ${VK_NS}..."
-          kubectl rollout status deployment/"$VK_DEPLOY" -n "$VK_NS" --timeout=2m || echo "    ⚠️  Warning: Rollout status check failed"
+
+          # Wait for deployment to be ready
+          kubectl wait --for=condition=available --timeout=3m deployment/"$VK_DEPLOY" -n "$VK_NS" 2>/dev/null || \
+            echo "    ⚠️  Warning: Deployment not available within timeout"
+
+          # Verify image version
+          NEW_VK_IMAGE=$(kubectl get deployment "$VK_DEPLOY" -n "$VK_NS" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+          echo "    New image: ${NEW_VK_IMAGE}"
+
+          if [[ "$NEW_VK_IMAGE" == *"${TARGET_VERSION}"* ]]; then
+            echo "    ✓ Successfully upgraded to ${TARGET_VERSION}"
+          else
+            echo "    ⚠️  Warning: Not upgraded to ${TARGET_VERSION}"
+          fi
         fi
       done <<< "$VK_DEPLOYMENTS"
     fi
@@ -667,14 +736,21 @@ for TENANT_NS in ${TENANT_NAMESPACES}; do
     echo "    ✓ GatewayServer annotated to trigger recreation"
   done
 
-  # If annotation doesn't work, delete and recreate WgGatewayClient resources
-  # This forces them to be regenerated from the updated templates
+  # Delete both WgGateway resources and gateway deployments to force full recreation
   WGGW_CLIENTS=$(kubectl get wggatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
   WGGW_SERVERS=$(kubectl get wggatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
 
-  if [ -n "$WGGW_CLIENTS" ] || [ -n "$WGGW_SERVERS" ]; then
-    echo "  Deleting WgGateway resources to trigger recreation from updated templates..."
+  if [ -n "$WGGW_CLIENTS" ] || [ -n "$WGGW_SERVERS" ] || [ -n "$GATEWAY_DEPLOYMENTS" ]; then
+    echo "  Deleting gateway resources to force recreation from updated templates..."
 
+    # Delete gateway deployments first
+    for GW in ${GATEWAY_DEPLOYMENTS}; do
+      echo "    Deleting gateway deployment: ${GW}"
+      kubectl delete deployment "${GW}" -n "${TENANT_NS}" --wait=false 2>/dev/null || true
+    done
+
+    # Delete WgGateway resources first
     for WGGW_CLIENT in ${WGGW_CLIENTS}; do
       echo "    Deleting wggatewayclient: ${WGGW_CLIENT}"
       kubectl delete wggatewayclient "${WGGW_CLIENT}" -n "${TENANT_NS}" --wait=false 2>/dev/null || true
@@ -685,70 +761,102 @@ for TENANT_NS in ${TENANT_NAMESPACES}; do
       kubectl delete wggatewayserver "${WGGW_SERVER}" -n "${TENANT_NS}" --wait=false 2>/dev/null || true
     done
 
-    echo "  Waiting for controller to recreate WgGateway resources from updated templates..."
-    sleep 10
+    # Wait for deletion to complete
+    sleep 5
+
+    # Clear GatewayClient/Server status to force controller to recreate WgGateway resources
+    for GW_CLIENT in ${GATEWAY_CLIENTS}; do
+      echo "    Clearing GatewayClient status for: ${GW_CLIENT}"
+      # Use kubectl patch with --subresource=status to clear the status
+      kubectl patch gatewayclient "${GW_CLIENT}" -n "${TENANT_NS}" \
+        --subresource=status \
+        --type='merge' -p='{"status":{"clientRef":null}}' 2>/dev/null || \
+      kubectl patch gatewayclient "${GW_CLIENT}" -n "${TENANT_NS}" \
+        --type='json' -p='[{"op": "remove", "path": "/status/clientRef"}]' 2>/dev/null || \
+      echo "      ⚠️  Could not clear status (may not exist)"
+    done
+
+    for GW_SERVER in ${GATEWAY_SERVERS}; do
+      echo "    Clearing GatewayServer status for: ${GW_SERVER}"
+      kubectl patch gatewayserver "${GW_SERVER}" -n "${TENANT_NS}" \
+        --subresource=status \
+        --type='merge' -p='{"status":{"serverRef":null}}' 2>/dev/null || \
+      kubectl patch gatewayserver "${GW_SERVER}" -n "${TENANT_NS}" \
+        --type='json' -p='[{"op": "remove", "path": "/status/serverRef"}]' 2>/dev/null || \
+      echo "      ⚠️  Could not clear status (may not exist)"
+    done
+
+    echo "  Waiting for controller to recreate gateway resources from updated templates..."
+    sleep 15
 
     # Wait for WgGatewayClient/Server to be recreated
-    TIMEOUT=60
+    echo "  Waiting for WgGateway resources to be recreated..."
+    TIMEOUT=120
     ELAPSED=0
+    WGGW_RECREATED=false
     while [ $ELAPSED -lt $TIMEOUT ]; do
       RECREATED_CLIENTS=$(kubectl get wggatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
       RECREATED_SERVERS=$(kubectl get wggatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
 
       if [ -n "$RECREATED_CLIENTS" ] || [ -n "$RECREATED_SERVERS" ]; then
         echo "  ✓ WgGateway resources recreated"
+        WGGW_RECREATED=true
         break
       fi
 
-      sleep 2
-      ELAPSED=$((ELAPSED + 2))
+      sleep 5
+      ELAPSED=$((ELAPSED + 5))
     done
 
-    if [ $ELAPSED -ge $TIMEOUT ]; then
-      echo "  ⚠️  Warning: WgGateway resources not recreated within timeout"
+    if [ "$WGGW_RECREATED" = false ]; then
+      echo "  ⚠️  Warning: WgGateway resources not recreated within ${TIMEOUT}s timeout"
     fi
-  fi
 
-  # Wait for gateway deployments to roll out with new images
-  echo "  Waiting for gateway deployments to update..."
-  sleep 5
-
-  GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-
-  for GW in ${GATEWAY_DEPLOYMENTS}; do
-    echo "  Monitoring gateway deployment: ${GW}"
-
-    # Wait for deployment to start updating
-    TIMEOUT=60
+    # Wait for gateway deployments to be recreated
+    echo "  Waiting for gateway deployments to be recreated..."
+    sleep 10
+    TIMEOUT=120
     ELAPSED=0
+    DEPLOYMENTS_RECREATED=false
     while [ $ELAPSED -lt $TIMEOUT ]; do
-      CURRENT_IMAGE=$(kubectl get deployment "${GW}" -n "${TENANT_NS}" \
-        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-      if [[ "$CURRENT_IMAGE" == *"${TARGET_VERSION}"* ]]; then
-        echo "    ✓ Deployment spec updated to ${TARGET_VERSION}"
+      RECREATED_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+      if [ -n "$RECREATED_DEPLOYMENTS" ]; then
+        echo "  ✓ Gateway deployments recreated: ${RECREATED_DEPLOYMENTS}"
+        DEPLOYMENTS_RECREATED=true
+
+        # Wait for each deployment to roll out
+        for GW in ${RECREATED_DEPLOYMENTS}; do
+          echo "    Monitoring gateway deployment: ${GW}"
+
+          # Wait for deployment to be ready
+          kubectl wait --for=condition=available --timeout=3m deployment/"${GW}" -n "${TENANT_NS}" 2>/dev/null || \
+            echo "      ⚠️  Warning: Deployment not available within timeout"
+
+          # Verify image version
+          GATEWAY_IMAGE=$(kubectl get deployment "${GW}" -n "${TENANT_NS}" \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="gateway")].image}' 2>/dev/null || echo "unknown")
+          echo "      Gateway image: ${GATEWAY_IMAGE}"
+
+          if [[ "$GATEWAY_IMAGE" == *"${TARGET_VERSION}"* ]]; then
+            echo "      ✓ Successfully upgraded to ${TARGET_VERSION}"
+          else
+            echo "      ⚠️  Warning: Not upgraded to ${TARGET_VERSION}"
+          fi
+        done
         break
       fi
-      sleep 2
-      ELAPSED=$((ELAPSED + 2))
+
+      sleep 5
+      ELAPSED=$((ELAPSED + 5))
     done
 
-    if [ $ELAPSED -ge $TIMEOUT ]; then
-      echo "    ⚠️  Warning: Deployment spec not updated after ${TIMEOUT}s"
-      echo "    Current image: ${CURRENT_IMAGE}"
+    if [ "$DEPLOYMENTS_RECREATED" = false ]; then
+      echo "  ⚠️  Warning: Gateway deployments not recreated within ${TIMEOUT}s timeout"
     fi
-
-    # Wait for rollout to complete
-    if kubectl rollout status deployment/"${GW}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null; then
-      echo "    ✓ Rollout completed"
-    else
-      echo "    ⚠️  Warning: Rollout did not complete"
-    fi
-
-    # Verify final state
-    FINAL_IMAGE=$(kubectl get deployment "${GW}" -n "${TENANT_NS}" \
-      -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-    echo "    Final image: ${FINAL_IMAGE}"
-  done
+  else
+    echo "  ℹ️  No gateway resources found to upgrade"
+  fi
 done
 
 if [ ${GATEWAY_COUNT} -eq 0 ]; then
