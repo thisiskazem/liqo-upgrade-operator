@@ -44,6 +44,27 @@ var coreControlPlaneComponents = []string{
 // Stage 2: Upgrade core control-plane components
 func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Idempotency check: verify job doesn't already exist
+	jobName := fmt.Sprintf("%s-%s", controllerManagerUpgradePrefix, upgrade.Name)
+	existingJob := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: upgrade.Spec.Namespace}, existingJob)
+
+	if err == nil {
+		// Job already exists, transition to monitoring phase without creating a new job
+		logger.Info("Controller manager upgrade job already exists, skipping creation")
+		statusUpdates := map[string]interface{}{
+			"currentStage":        2,
+			"lastSuccessfulPhase": upgrade.Status.LastSuccessfulPhase,
+		}
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Monitoring core control-plane upgrade", statusUpdates)
+	} else if !errors.IsNotFound(err) {
+		// Unexpected error
+		logger.Error(err, "Failed to check for existing controller manager upgrade job")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Job doesn't exist, create it
 	logger.Info("Stage 2: Starting core control-plane upgrade")
 
 	job := r.buildControllerManagerUpgradeJob(upgrade)
@@ -56,6 +77,8 @@ func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Contex
 			logger.Error(err, "Failed to create core control-plane upgrade job")
 			return r.fail(ctx, upgrade, "Failed to create core control-plane upgrade job")
 		}
+		// Job was created by another reconciliation, that's OK
+		logger.Info("Controller manager upgrade job was just created by another reconciliation")
 	}
 
 	// Pass all status updates in additionalUpdates map to ensure they are persisted
