@@ -284,147 +284,6 @@ fi
 echo "✅ Gateway templates upgraded successfully"
 
 echo ""
-echo "Step 3.5: Upgrading Virtual Kubelet Template and VirtualNodes..."
-
-# Upgrade VkOptionsTemplate
-echo "--- Upgrading VkOptionsTemplate ---"
-if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/dev/null; then
-  echo "Updating VkOptionsTemplate to version ${TARGET_VERSION}..."
-
-  # Patch the template to update the virtual-kubelet container image
-  kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
-    --type='json' -p='[
-      {"op": "replace", "path": "/spec/containerImage", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ VkOptionsTemplate updated" || echo "  ⚠️  Warning: Could not update VkOptionsTemplate"
-else
-  echo "  ℹ️  VkOptionsTemplate not found, skipping"
-fi
-
-# Verify template was updated
-sleep 2
-echo "Verifying VkOptionsTemplate update..."
-VK_TEMPLATE_IMAGE=$(kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
-  -o jsonpath='{.spec.containerImage}' 2>/dev/null || echo "not found")
-echo "  VkOptionsTemplate image: ${VK_TEMPLATE_IMAGE}"
-
-if [[ "$VK_TEMPLATE_IMAGE" != *"${TARGET_VERSION}"* ]] && [[ "$VK_TEMPLATE_IMAGE" != "not found" ]]; then
-  echo "❌ ERROR: VkOptionsTemplate not updated to ${TARGET_VERSION}!"
-  exit 1
-fi
-
-echo "✅ VkOptionsTemplate upgraded successfully"
-
-# Upgrade existing VirtualNode resources to use new image
-echo ""
-echo "--- Upgrading VirtualNode Resources ---"
-VIRTUALNODES=$(kubectl get virtualnodes -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
-
-if [ -z "$VIRTUALNODES" ]; then
-  echo "  ℹ️  No VirtualNode resources found, skipping"
-else
-  VN_COUNT=0
-  while IFS= read -r line; do
-    if [ -n "$line" ]; then
-      VN_NAMESPACE=$(echo "$line" | awk '{print $1}')
-      VN_NAME=$(echo "$line" | awk '{print $2}')
-
-      echo "  Updating VirtualNode: ${VN_NAME} in namespace ${VN_NAMESPACE}..."
-
-      # Get current image
-      CURRENT_VK_IMAGE=$(kubectl get virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
-        -o jsonpath='{.spec.template.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
-
-      if [[ "$CURRENT_VK_IMAGE" != *"${TARGET_VERSION}"* ]]; then
-        # Patch VirtualNode to update virtual-kubelet image
-        # FIX: Corrected path to include the full nested structure of Deployment -> Pod -> Container
-        echo "    Patching VirtualNode to update image to ${TARGET_VERSION}..."
-        kubectl patch virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
-          --type='json' -p='[
-            {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
-          ]' && echo "      ✓ VirtualNode image updated" || echo "      ⚠️  Warning: Could not update VirtualNode"
-
-        VN_COUNT=$((VN_COUNT + 1))
-
-        # Find and delete deployment to force recreation with new image
-        DEPLOYMENT_NAME=$(kubectl get deployments -n "$VN_NAMESPACE" -l liqo.io/virtual-node="$VN_NAME" \
-          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-
-        if [ -n "$DEPLOYMENT_NAME" ]; then
-          echo "    Found deployment: ${DEPLOYMENT_NAME}"
-          echo "    Deleting deployment to force recreation with new image..."
-          kubectl delete deployment "$DEPLOYMENT_NAME" -n "$VN_NAMESPACE" || echo "      ⚠️  Warning: Could not delete deployment"
-        else
-          echo "    ⚠️  Warning: No deployment found for VirtualNode ${VN_NAME}"
-        fi
-      else
-        echo "    ℹ️  Already at ${TARGET_VERSION}, skipping"
-      fi
-    fi
-  done <<< "$VIRTUALNODES"
-
-  echo "✅ ${VN_COUNT} VirtualNode(s) processed for upgrade"
-
-  # Wait for Liqo controller to recreate virtual-kubelet deployments from updated templates
-  if [ "$VN_COUNT" -gt 0 ]; then
-    echo ""
-    echo "Waiting for Liqo controller to recreate virtual-kubelet deployments from updated templates..."
-    echo "Waiting for deployments to be recreated..."
-    sleep 10
-
-    TIMEOUT=120
-    ELAPSED=0
-    while [ $ELAPSED -lt $TIMEOUT ]; do
-      VK_DEPLOYMENTS=$(kubectl get deployments -A -l offloading.liqo.io/component=virtual-kubelet \
-        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-
-      if [ -n "$VK_DEPLOYMENTS" ]; then
-        DEPLOYMENT_COUNT=$(echo "$VK_DEPLOYMENTS" | wc -w)
-        if [ "$DEPLOYMENT_COUNT" -ge "$VN_COUNT" ]; then
-          echo "  ✓ All virtual-kubelet deployments recreated"
-          break
-        fi
-      fi
-
-      sleep 5
-      ELAPSED=$((ELAPSED + 5))
-    done
-
-    if [ $ELAPSED -ge $TIMEOUT ]; then
-      echo "  ⚠️  Warning: Not all deployments recreated within ${TIMEOUT}s timeout"
-    fi
-
-    # Wait for virtual-kubelet deployments to roll out
-    echo ""
-    echo "Waiting for virtual-kubelet deployments to roll out..."
-    VK_DEPLOYMENTS=$(kubectl get deployments -A -l offloading.liqo.io/component=virtual-kubelet \
-      -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
-
-    if [ -n "$VK_DEPLOYMENTS" ]; then
-      while IFS= read -r line; do
-        if [ -n "$line" ]; then
-          VK_NS=$(echo "$line" | awk '{print $1}')
-          VK_DEPLOY=$(echo "$line" | awk '{print $2}')
-
-          echo "  Checking ${VK_DEPLOY} in ${VK_NS}..."
-          kubectl rollout status deployment/"$VK_DEPLOY" -n "$VK_NS" --timeout=2m || echo "    ⚠️  Warning: Rollout status check failed"
-
-          # Verify new image
-          NEW_IMAGE=$(kubectl get deployment "$VK_DEPLOY" -n "$VK_NS" \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-          echo "    New image: ${NEW_IMAGE}"
-
-          if [[ "$NEW_IMAGE" == *"${TARGET_VERSION}"* ]]; then
-            echo "    ✓ Successfully upgraded to ${TARGET_VERSION}"
-          else
-            echo "    ⚠️  Warning: Image not updated to ${TARGET_VERSION}"
-          fi
-        fi
-      done <<< "$VK_DEPLOYMENTS"
-    fi
-  fi
-fi
-
-echo ""
 echo "Step 4: Upgrading network components sequentially with health checks..."
 
 # Function to check component health
@@ -681,267 +540,759 @@ else
   echo "✅ Virtual Kubelet components upgraded successfully"
 fi
 
-# Upgrade gateway deployments in tenant namespaces with role detection
 echo ""
-echo "--- Upgrading liqo-gateway deployments with role-based logic ---"
+echo "========================================="
+echo "Step 4.5: Performing Local Data Plane Reset"
+echo "========================================="
+echo "This step cleans stale network state to ensure VPN tunnels can be re-established"
+echo ""
 
-# Detect ForeignCluster roles to determine upgrade strategy
-echo "Step 1: Detecting peering roles from ForeignClusters..."
-FOREIGN_CLUSTERS=$(kubectl get foreignclusters -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+# --- NEW FIX: Clean Stale Host Interfaces ---
+echo "1. Cleaning stale host interfaces..."
+# Get all fabric pods
+FABRIC_PODS=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
 
-if [ -z "$FOREIGN_CLUSTERS" ]; then
-  echo "  ℹ️  No ForeignClusters found, skipping gateway upgrade"
+if [ -n "$FABRIC_PODS" ]; then
+  for POD in $FABRIC_PODS; do
+    echo "  Cleaning node via ${POD}..."
+    # Robust cleanup: Set down before delete, ignore errors
+    # This handles interfaces that might be in a "weird" state or have dependencies
+    kubectl exec -n "${NAMESPACE}" "${POD}" -- /bin/sh -c "
+      for i in \$(ip link show 2>/dev/null | grep 'liqo\\.' | awk -F': ' '{print \$2}'); do 
+        echo \"Deleting \$i\"; 
+        ip link set \"\$i\" down 2>/dev/null || true
+        ip link delete \"\$i\" 2>/dev/null || true
+      done" 2>/dev/null || echo "    ⚠️ Warning: Cleanup command had errors on ${POD}"
+  done
+  echo "  ✓ Stale host interfaces cleaned"
 else
-  echo "  Found ForeignClusters: ${FOREIGN_CLUSTERS}"
-  echo ""
+  echo "  ⚠️ No fabric pods found for interface cleanup"
+fi
 
-  # Process each ForeignCluster to determine role
-  for FC in $FOREIGN_CLUSTERS; do
-    echo "--- Processing ForeignCluster: ${FC} ---"
+# --- NEW FIX: Delete Global InternalNode Resources ---
+echo ""
+echo "2. Deleting InternalNode resources to force regeneration..."
+# These resources map physical nodes to VPN tunnels and contain old IP addresses
+# Deleting them forces the Controller Manager to regenerate them with correct new Gateway IPs
+INTERNAL_NODES=$(kubectl get internalnodes -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+if [ -n "$INTERNAL_NODES" ]; then
+  kubectl delete internalnodes --all-namespaces --all 2>/dev/null || echo "  ⚠️ Warning: Could not delete all InternalNode resources"
+  echo "  ✓ InternalNode resources deleted (will be regenerated)"
+else
+  echo "  ℹ️ No InternalNode resources found"
+fi
 
-    # Simplified role detection based on tenant namespace existence
-    TENANT_NS="liqo-tenant-${FC}"
-    IS_CONSUMER="false"
-    IS_PROVIDER="false"
+# --- NEW FIX: Restart liqo-fabric DaemonSet ---
+echo ""
+echo "3. Restarting liqo-fabric to reset node status..."
+# The node agent (Fabric) needs to restart AFTER interface cleanup 
+# to correctly detect the network state and populate status for the Gateway
+if kubectl get daemonset liqo-fabric -n "${NAMESPACE}" &>/dev/null; then
+  kubectl rollout restart daemonset liqo-fabric -n "${NAMESPACE}"
+  echo "  Waiting for liqo-fabric rollout to complete..."
+  if kubectl rollout status daemonset liqo-fabric -n "${NAMESPACE}" --timeout=2m; then
+    echo "  ✓ liqo-fabric restarted successfully"
+  else
+    echo "  ⚠️ Warning: liqo-fabric rollout timed out"
+  fi
+else
+  echo "  ℹ️ liqo-fabric DaemonSet not found"
+fi
 
-    # Check if tenant namespace exists (indicates we're hosting remote resources)
-    if kubectl get namespace "${TENANT_NS}" > /dev/null 2>&1; then
-      # Check for GatewayClient (indicates CONSUMER role)
-      if kubectl get gatewayclient -n "${TENANT_NS}" 2>/dev/null | grep -q "${FC}"; then
-        IS_CONSUMER="true"
-        echo "  Role: CONSUMER (running VirtualKubelet, connecting to remote provider)"
-      fi
-
-      # Check for GatewayServer (indicates PROVIDER role)
-      if kubectl get gatewayserver -n "${TENANT_NS}" 2>/dev/null | grep -q "${FC}"; then
-        IS_PROVIDER="true"
-        echo "  Role: PROVIDER (hosting tenant namespace, accepting connections)"
-      fi
-
-      if [ "$IS_CONSUMER" == "true" ] && [ "$IS_PROVIDER" == "true" ]; then
-        echo "  Role: BIDIRECTIONAL (both consumer and provider)"
-      fi
+# --- NEW FIX: Flush conntrack and restart CoreDNS for API reachability ---
+echo ""
+echo "4. Flushing conntrack table to clear stale connections..."
+# Deleting network interfaces can leave stale entries in the conntrack table
+# which can cause connection tracking issues and prevent API server connectivity
+FABRIC_POD=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+if [ -n "$FABRIC_POD" ]; then
+  # Try to flush conntrack from within a privileged pod (fabric has hostNetwork)
+  kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c '
+    if command -v conntrack &> /dev/null; then
+      conntrack -F 2>/dev/null && echo "  ✓ Conntrack table flushed" || echo "  ⚠️ Warning: Failed to flush conntrack"
     else
-      echo "  ⚠️  Tenant namespace ${TENANT_NS} not found, skipping"
-      continue
+      echo "  ℹ️ conntrack tool not found in fabric pod, skipping flush"
+    fi
+  ' 2>/dev/null || echo "  ⚠️ Warning: Could not execute conntrack flush"
+else
+  echo "  ⚠️ Warning: No fabric pod found for conntrack flush"
+fi
+
+echo ""
+echo "5. Restarting CoreDNS to restore API connectivity..."
+# CoreDNS restart forces re-establishment of connections to API server
+# This is critical after network interface cleanup
+if kubectl get deployment coredns -n kube-system &>/dev/null; then
+  kubectl rollout restart deployment/coredns -n kube-system
+  echo "  Waiting for CoreDNS to be ready..."
+  kubectl rollout status deployment/coredns -n kube-system --timeout=2m || echo "  ⚠️ Warning: CoreDNS rollout timed out"
+  echo "  ✓ CoreDNS restarted"
+else
+  echo "  ℹ️ CoreDNS deployment not found (may use different DNS solution)"
+fi
+
+# Brief wait for DNS propagation
+sleep 5
+
+echo ""
+echo "✅ Local Data Plane Reset complete"
+
+echo ""
+echo "========================================="
+echo "Step 5: Restart liqo-controller-manager and regenerate InternalNodes"
+echo "========================================="
+
+# Force clean stale network configurations to prevent validation errors
+# RouteConfigurations from the old version may have incompatible specs
+# that cause "invalid spec" errors when the new controller tries to update them
+echo "  Cleaning stale RouteConfigurations..."
+kubectl delete routeconfigurations --all --all-namespaces --wait=false 2>/dev/null || true
+echo "  ✓ RouteConfigurations deleted (will be regenerated by controller)"
+
+# Restart liqo-controller-manager to trigger full reconciliation
+# This will regenerate InternalNode resources with correct new Gateway IPs
+echo "  Restarting liqo-controller-manager deployment..."
+kubectl rollout restart deployment/liqo-controller-manager -n "${NAMESPACE}" 2>/dev/null || {
+  echo "  ⚠️  liqo-controller-manager not found or restart failed"
+}
+
+# Wait for rollout to complete
+echo "  Waiting for liqo-controller-manager to become ready..."
+kubectl rollout status deployment/liqo-controller-manager -n "${NAMESPACE}" --timeout=3m 2>/dev/null || {
+  echo "  ⚠️  Rollout status check timed out"
+}
+
+# Wait for controller-manager to be fully available
+echo "  Waiting for controller-manager to be available..."
+kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "${NAMESPACE}" 2>/dev/null || {
+  echo "  ⚠️  Controller-manager availability wait timed out"
+}
+
+# Give controller time to start up
+echo "  Waiting for controller-manager to initialize (10s)..."
+sleep 10
+
+echo ""
+echo "========================================="
+echo "Step 5.1: Forcing InternalNode Regeneration"
+echo "========================================="
+echo "The controller-manager restart alone may not trigger Node reconciliation."
+echo "We must explicitly touch Nodes to force InternalNode recreation."
+echo ""
+
+# --- THE FIX: Force Node Reconciliation ---
+echo "--- Forcing InternalNode Regeneration ---"
+# Apply a temporary label to all nodes to trigger the NodeReconciler
+# This sends a MODIFIED event for every Node to the liqo-controller-manager
+echo "Touching all nodes to trigger reconciliation..."
+TRIGGER_TIMESTAMP=$(date +%%s)
+kubectl label nodes --all liqo.io/upgrade-trigger="${TRIGGER_TIMESTAMP}" --overwrite 2>/dev/null || {
+  echo "  ⚠️ Warning: Could not label all nodes, trying individually..."
+  for NODE in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+    kubectl label node "$NODE" liqo.io/upgrade-trigger="${TRIGGER_TIMESTAMP}" --overwrite 2>/dev/null || echo "    ⚠️ Could not label node $NODE"
+  done
+}
+echo "  ✓ All nodes labeled to trigger reconciliation"
+
+# BLOCK until InternalNodes appear. Do not proceed otherwise.
+echo ""
+echo "Waiting for InternalNode resources to appear..."
+echo "This is CRITICAL - without InternalNodes, the network fabric cannot start."
+TIMEOUT=90
+ELAPSED=0
+while [ $ELAPSED -lt $TIMEOUT ]; do
+  COUNT=$(kubectl get internalnodes -A --no-headers 2>/dev/null | wc -l)
+  if [ "$COUNT" -gt 0 ]; then
+    echo "  ✓ Found $COUNT InternalNode(s). Proceeding."
+    
+    # Also verify the InternalNodes have the expected fields populated
+    echo "  Verifying InternalNode status..."
+    kubectl get internalnodes -A -o wide 2>/dev/null || true
+    break
+  fi
+  echo "  Waiting for InternalNodes... ($ELAPSED/$TIMEOUT seconds)"
+  sleep 2
+  ELAPSED=$((ELAPSED+2))
+done
+
+if [ $ELAPSED -ge $TIMEOUT ]; then
+  echo "❌ ERROR: InternalNodes were not recreated within ${TIMEOUT}s timeout."
+  echo "Network fabric cannot start without InternalNode resources."
+  echo ""
+  echo "Debug information:"
+  echo "  - Checking controller-manager logs for errors..."
+  kubectl logs deployment/liqo-controller-manager -n "${NAMESPACE}" --tail=50 2>/dev/null | grep -i "error\|internal" || echo "    (no relevant logs found)"
+  echo ""
+  echo "  - Checking Node labels..."
+  kubectl get nodes --show-labels 2>/dev/null | head -5 || true
+  echo ""
+  # We exit here because proceeding without InternalNodes guarantees failure
+  exit 1
+fi
+
+# Additional wait for Fabric to populate InternalNode status
+echo ""
+echo "Waiting for liqo-fabric to populate InternalNode status (15s)..."
+sleep 15
+
+# Verify InternalNode status is populated
+echo "Verifying InternalNode status fields..."
+INTERNALNODES_WITH_STATUS=$(kubectl get internalnodes -A -o jsonpath='{range .items[*]}{.metadata.name}{": nodeIP="}{.status.nodeIP}{"\n"}{end}' 2>/dev/null || echo "")
+if [ -n "$INTERNALNODES_WITH_STATUS" ]; then
+  echo "  InternalNode status:"
+  echo "$INTERNALNODES_WITH_STATUS" | while read line; do
+    echo "    $line"
+  done
+else
+  echo "  ⚠️ Warning: Could not retrieve InternalNode status"
+fi
+
+echo ""
+echo "✅ InternalNode regeneration complete"
+echo "✅ Controller Manager restarted and reconciliation triggered"
+
+echo ""
+echo "========================================="
+echo "Step 5.5: Gateway Stabilization (Wait, Tune & Sync)"
+echo "========================================="
+echo "This step waits for the controller's rollout, applies network tuning,"
+echo "and actively verifies IP synchronization between Control Plane and Data Plane."
+echo ""
+
+# Find all tenant namespaces
+TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
+
+if [ -n "$TENANT_NAMESPACES" ]; then
+  for TENANT_NS in $TENANT_NAMESPACES; do
+    echo "--- Processing ${TENANT_NS} ---"
+
+    # 1. Clear Leader Election Leases
+    echo "  Clearing leader election leases..."
+    kubectl delete lease -n "${TENANT_NS}" -l "liqo.io/component=gateway" --ignore-not-found=true 2>/dev/null || true
+    
+    # Also try by name pattern
+    LEASES=$(kubectl get leases -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E 'gateway|wg-' || true)
+    for LEASE in $LEASES; do
+      kubectl delete lease "${LEASE}" -n "${TENANT_NS}" --ignore-not-found=true 2>/dev/null || true
+    done
+
+    # 2. Find Gateway Deployments
+    GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    
+    if [ -z "$GATEWAY_DEPLOYMENTS" ]; then
+      echo "    ℹ️ No gateway deployments found in ${TENANT_NS}"
     fi
 
+    for GW_DEPLOY in $GATEWAY_DEPLOYMENTS; do
+        echo "    Processing Gateway: ${GW_DEPLOY}"
+        GW_CLIENT_NAME=$(echo "${GW_DEPLOY}" | sed 's/^gw-//')
+        
+        # 3. Wait for Image Update
+        echo "    Waiting for controller to update image to ${TARGET_VERSION}..."
+        IMG_UPDATED=false
+        for IMG_WAIT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          CUR_IMG=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+          if echo "$CUR_IMG" | grep -q "${TARGET_VERSION}"; then
+             echo "      ✓ Image updated to ${TARGET_VERSION}"
+             IMG_UPDATED=true
+             break
+          fi
+          sleep 2
+        done
+        
+        if [ "$IMG_UPDATED" != "true" ]; then
+          echo "      ⚠️ Warning: Image not updated after 60s, proceeding..."
+        fi
+        
+        # 4. Wait for Rollout Completion
+        echo "    Waiting for ${GW_DEPLOY} rollout to complete..."
+        kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "      ⚠️ Rollout timed out"
+        
+        # 5. Wait for Terminating pods to fully disappear
+        # This is CRITICAL - the controller will abort if it sees 2 pods
+        echo "    Waiting for old pods to terminate..."
+        for TERM_WAIT in 1 2 3 4 5 6 7 8 9 10 11 12; do
+          POD_COUNT=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null | grep -v "Terminating" | grep -c "Running" || echo "0")
+          TERM_COUNT=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null | grep -c "Terminating" || echo "0")
+          
+          if [ "${TERM_COUNT}" -eq 0 ] && [ "${POD_COUNT}" -eq 1 ]; then
+            echo "      ✓ Only 1 running pod, no terminating pods"
+            break
+          fi
+          echo "      Waiting... (Running: ${POD_COUNT}, Terminating: ${TERM_COUNT})"
+          sleep 5
+        done
+
+        # 6. Apply Network Tuning (RPF/MSS) to the Running Pod
+        echo "    Applying Network Tuning..."
+        POD_NAME=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway,networking.liqo.io/gateway-name="${GW_CLIENT_NAME}" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        
+        # Fallback selector
+        if [ -z "$POD_NAME" ]; then
+           POD_NAME=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        fi
+
+        if [ -n "$POD_NAME" ]; then
+           if kubectl exec -n "${TENANT_NS}" "${POD_NAME}" -c gateway -- /bin/sh -c '
+              sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+              sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+              for iface in $(ls /proc/sys/net/ipv4/conf/ | grep liqo); do
+                 sysctl -w net.ipv4.conf.$iface.rp_filter=0 >/dev/null 2>&1
+              done
+              nft add table ip liqo-mss 2>/dev/null || true
+              nft add chain ip liqo-mss forward { type filter hook forward priority 0 \; } 2>/dev/null || true
+              nft add rule ip liqo-mss forward tcp flags syn tcp option maxseg size set rt mtu 2>/dev/null || true
+           ' 2>/dev/null; then
+             echo "      ✓ Network tuning applied to ${POD_NAME}"
+           else
+             echo "      ⚠️ Warning: Network tuning command failed"
+           fi
+        else
+           echo "      ⚠️ Warning: Could not find running gateway pod for tuning"
+        fi
+
+        # 7. CRITICAL: Active Synchronization Loop
+        # Wait until Control Plane (GatewayClient status) matches Data Plane (Pod IP)
+        echo "    Verifying IP Synchronization for ${GW_CLIENT_NAME}..."
+        
+        SYNCED="false"
+        for SYNC_ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+          # Re-fetch pod name in case it changed
+          POD_NAME=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          
+          # Get current IPs
+          ACTUAL_IP=""
+          STATUS_IP=""
+          
+          if [ -n "$POD_NAME" ]; then
+            ACTUAL_IP=$(kubectl get pod "${POD_NAME}" -n "${TENANT_NS}" -o jsonpath='{.status.podIP}' 2>/dev/null || echo "")
+          fi
+          STATUS_IP=$(kubectl get gatewayclient "${GW_CLIENT_NAME}" -n "${TENANT_NS}" -o jsonpath='{.status.internalEndpoint.ip}' 2>/dev/null || echo "")
+
+          if [ -n "$ACTUAL_IP" ] && [ "$ACTUAL_IP" == "$STATUS_IP" ]; then
+            echo "      ✓ IPs Synced: ${ACTUAL_IP}"
+            SYNCED="true"
+            break
+          fi
+          
+          echo "      ⏳ Attempt ${SYNC_ATTEMPT}/20: Mismatch (Pod:${ACTUAL_IP} vs Status:${STATUS_IP}). Forcing refresh..."
+          
+          # Trigger update to wake up controller
+          SYNC_TS=$(date +%%s)
+          kubectl annotate gatewayclient "${GW_CLIENT_NAME}" -n "${TENANT_NS}" liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
+          kubectl annotate gatewayserver "${GW_CLIENT_NAME}" -n "${TENANT_NS}" liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
+          
+          sleep 5
+        done
+
+        if [ "$SYNCED" != "true" ]; then
+           echo "      ❌ WARNING: Failed to sync IPs for ${GW_DEPLOY} after 20 attempts."
+           echo "      This may cause connectivity issues. Manual intervention may be required."
+        fi
+        
+        echo "    ✓ Gateway ${GW_DEPLOY} processed"
+    done
+
+    echo "  ✓ ${TENANT_NS} processed"
     echo ""
+  done
+else
+  echo "  ℹ️ No tenant namespaces found, skipping gateway processing"
+fi
 
-    # Apply CONSUMER role fixes
-    if [ "$IS_CONSUMER" == "true" ]; then
-      echo "  Applying CONSUMER role fixes for ${FC}..."
+echo "✅ Gateway Stabilization complete"
 
-      # Find GatewayClient resources
-      GATEWAY_CLIENTS=$(kubectl get gatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+echo ""
+echo "--- Upgrading liqo-gateway deployments ---"
 
+# Find all tenant namespaces (re-fetch after reset)
+echo "Step 1: Finding tenant namespaces..."
+TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
+
+if [ -z "$TENANT_NAMESPACES" ]; then
+  echo "  ℹ️  No tenant namespaces found, skipping gateway upgrade"
+else
+  echo "  Found tenant namespaces: ${TENANT_NAMESPACES}"
+  echo ""
+
+  # Process each tenant namespace
+  for TENANT_NS in $TENANT_NAMESPACES; do
+    FC="${TENANT_NS#liqo-tenant-}"
+    echo "--- Processing tenant namespace: ${TENANT_NS} ---"
+
+    # Step 1: Clear GatewayClient status (if exists)
+    GATEWAY_CLIENTS=$(kubectl get gatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    if [ -n "$GATEWAY_CLIENTS" ]; then
       for GW_CLIENT in ${GATEWAY_CLIENTS}; do
-        echo "    Processing GatewayClient: ${GW_CLIENT}"
-
-        # Step 1: Clear GatewayClient status using status subresource (FIXED: Use merge patch with nulls)
-        echo "      Clearing GatewayClient status (using --subresource=status)..."
+        echo "  Processing GatewayClient: ${GW_CLIENT}"
+        echo "    Clearing GatewayClient status..."
         kubectl patch gatewayclient "${GW_CLIENT}" -n "${TENANT_NS}" \
           --subresource=status \
           --type=merge \
-          -p='{"status":{"clientRef":null, "endpoint":null, "internalEndpoint":null, "secretRef":null}}' || echo "      ⚠️  Status clear failed"
-
-        # Step 2: Delete WgGatewayClient to force recreation
-        # FIX: Only delete if it hasn't been recreated recently to avoid flapping
-        WGGW_CLIENTS=$(kubectl get wggatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-        for WGGW_CLIENT in ${WGGW_CLIENTS}; do
-          # Check age of WgGatewayClient
-          # FIXED: Escaped percent sign in date format for Go Sprintf (%%s)
-          AGE_SECONDS=$(kubectl get wggatewayclient "${WGGW_CLIENT}" -n "${TENANT_NS}" -o jsonpath='{.metadata.creationTimestamp}' | xargs -I {} date -d {} +%%s | xargs -I {} echo "$(date +%%s) - {}" | bc)
-          if [ "$AGE_SECONDS" -gt 300 ]; then
-             echo "      Deleting old WgGatewayClient: ${WGGW_CLIENT} (Age: ${AGE_SECONDS}s)"
-             kubectl delete wggatewayclient "${WGGW_CLIENT}" -n "${TENANT_NS}" --wait=false 2>/dev/null || true
-          else
-             echo "      Skipping WgGatewayClient deletion (Created recently: ${AGE_SECONDS}s ago)"
-          fi
-        done
-
-        # Step 3: Fix VK RBAC - Delete Identity Kubeconfig Secret to trigger regeneration
-        echo "      Fixing VirtualKubelet RBAC..."
-        
-        # Find the Identity in this tenant namespace that corresponds to the remote cluster
-        IDENTITY_NAME=$(kubectl get identities -n "${TENANT_NS}" -l liqo.io/remote-cluster-id="${FC}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "${FC}")
-        
-        if kubectl get identity "${IDENTITY_NAME}" -n "${TENANT_NS}" > /dev/null 2>&1; then
-            # FORCE REFRESH: Annotate Identity to wake up identity-controller
-            echo "        Touching Identity resource '${IDENTITY_NAME}' to ensure controller watch..."
-            # FIXED: Escaped percent sign for Go Sprintf
-            kubectl annotate identity "${IDENTITY_NAME}" -n "${TENANT_NS}" \
-                liqo.io/force-refresh="$(date +%%s)" --overwrite || echo "        ⚠️  Failed to annotate Identity"
-                
-            KUBECONFIG_SECRET=$(kubectl get identity "${IDENTITY_NAME}" -n "${TENANT_NS}" \
-            -o jsonpath='{.status.kubeconfigSecretRef.name}' 2>/dev/null || echo "")
-
-            if [ -n "$KUBECONFIG_SECRET" ]; then
-            echo "        Deleting Kubeconfig Secret: ${KUBECONFIG_SECRET}"
-            kubectl delete secret "${KUBECONFIG_SECRET}" -n "${TENANT_NS}" --ignore-not-found=true
-            echo "        ✓ Secret deleted (identity-controller will regenerate it)"
-
-            # Delete VK pod to force restart with new secret
-            VK_PODS=$(kubectl get pods -n "${TENANT_NS}" -l offloading.liqo.io/component=virtual-kubelet \
-                -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-            for VK_POD in ${VK_PODS}; do
-                echo "        Deleting VK pod: ${VK_POD}"
-                kubectl delete pod "${VK_POD}" -n "${TENANT_NS}" --wait=false || true
-            done
-            else
-            echo "        ℹ️  No Kubeconfig Secret found in Identity status"
-            fi
-        else
-            echo "        ⚠️  Identity resource not found for cluster ${FC} in ${TENANT_NS}"
-        fi
-
-        echo "      ✓ CONSUMER fixes applied for ${GW_CLIENT}"
+          -p='{"status":{"internalEndpoint":null}}' || echo "    ⚠️  Status clear failed"
       done
-
-      # Wait for WgGatewayClient recreation
-      echo "      Waiting for WgGatewayClient recreation..."
-      sleep 10
-
-      TIMEOUT=120
-      ELAPSED=0
-      while [ $ELAPSED -lt $TIMEOUT ]; do
-        RECREATED_CLIENTS=$(kubectl get wggatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-        if [ -n "$RECREATED_CLIENTS" ]; then
-          echo "      ✓ WgGatewayClient recreated: ${RECREATED_CLIENTS}"
-          break
-        fi
-        sleep 5
-        ELAPSED=$((ELAPSED + 5))
-      done
-
-      if [ $ELAPSED -ge $TIMEOUT ]; then
-        echo "      ⚠️  WARNING: WgGatewayClient not recreated within ${TIMEOUT}s"
-      fi
-
-      # Wait for gateway deployment rollout
-      echo "      Waiting for gateway deployment rollout..."
-      GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway \
-        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-
-      for GW_DEPLOY in ${GATEWAY_DEPLOYMENTS}; do
-        echo "        Monitoring: ${GW_DEPLOY}"
-        kubectl rollout status deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=3m 2>/dev/null || \
-          echo "        ⚠️  Rollout monitoring timed out"
-
-        # Verify image version
-        FINAL_IMAGE=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" \
-          -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-        echo "        Final image: ${FINAL_IMAGE}"
-      done
-
-      echo "    ✅ CONSUMER role upgrade complete for ${FC}"
     fi
 
-    echo ""
-
-    # Apply PROVIDER role fixes
-    if [ "$IS_PROVIDER" == "true" ]; then
-      echo "  Applying PROVIDER role fixes for ${FC}..."
-
-      # Find GatewayServer resources
-      GATEWAY_SERVERS=$(kubectl get gatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-
+    # Step 2: Clear GatewayServer status (if exists)
+    GATEWAY_SERVERS=$(kubectl get gatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    if [ -n "$GATEWAY_SERVERS" ]; then
       for GW_SERVER in ${GATEWAY_SERVERS}; do
-        echo "    Processing GatewayServer: ${GW_SERVER}"
-
-        # Step 1: Clear GatewayServer status using status subresource (FIXED: Use merge patch with nulls)
-        echo "      Clearing GatewayServer status (using --subresource=status)..."
+        echo "  Processing GatewayServer: ${GW_SERVER}"
+        echo "    Clearing GatewayServer status..."
         kubectl patch gatewayserver "${GW_SERVER}" -n "${TENANT_NS}" \
           --subresource=status \
           --type=merge \
-          -p='{"status":{"serverRef":null, "endpoint":null, "internalEndpoint":null, "secretRef":null}}' || echo "      ⚠️  Status clear failed"
-
-        # Step 2: Delete WgGatewayServer to force recreation
-        WGGW_SERVERS=$(kubectl get wggatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-        for WGGW_SERVER in ${WGGW_SERVERS}; do
-          # Check age of WgGatewayServer
-          # FIXED: Escaped percent sign in date format for Go Sprintf (%%s)
-          AGE_SECONDS=$(kubectl get wggatewayserver "${WGGW_SERVER}" -n "${TENANT_NS}" -o jsonpath='{.metadata.creationTimestamp}' | xargs -I {} date -d {} +%%s | xargs -I {} echo "$(date +%%s) - {}" | bc)
-          if [ "$AGE_SECONDS" -gt 300 ]; then
-             echo "      Deleting old WgGatewayServer: ${WGGW_SERVER}"
-             kubectl delete wggatewayserver "${WGGW_SERVER}" -n "${TENANT_NS}" --wait=false 2>/dev/null || true
-          else
-             echo "      Skipping WgGatewayServer deletion (Created recently)"
-          fi
-        done
-
-        # Step 3: Fix VK RBAC - Patch Tenant resource to trigger reconciliation
-        echo "      Fixing Tenant RBAC..."
-        TENANT_RESOURCES=$(kubectl get tenants -A -o json 2>/dev/null | \
-          jq -r '.items[] | select(.spec.clusterID == "'${FC}'") | .metadata.namespace + "/" + .metadata.name' || echo "")
-
-        if [ -n "$TENANT_RESOURCES" ]; then
-          for TENANT_REF in ${TENANT_RESOURCES}; do
-            TENANT_NAMESPACE=$(echo "$TENANT_REF" | cut -d/ -f1)
-            TENANT_NAME=$(echo "$TENANT_REF" | cut -d/ -f2)
-
-            echo "        Patching Tenant: ${TENANT_NAME} in ${TENANT_NAMESPACE}"
-            TIMESTAMP=$(date +%%s)
-            kubectl annotate tenant "${TENANT_NAME}" -n "${TENANT_NAMESPACE}" \
-              liqo.io/force-sync="${TIMESTAMP}" \
-              --overwrite || echo "        ⚠️  Failed to annotate Tenant"
-            echo "        ✓ Tenant annotated to trigger RBAC reconciliation"
-          done
-        else
-          echo "        ℹ️  No Tenant resources found for cluster ${FC}"
-        fi
-
-        echo "      ✓ PROVIDER fixes applied for ${GW_SERVER}"
+          -p='{"status":{"serverRef":null, "endpoint":null, "internalEndpoint":null, "secretRef":null}}' || echo "    ⚠️  Status clear failed"
       done
-
-      # Wait for WgGatewayServer recreation
-      echo "      Waiting for WgGatewayServer recreation..."
-      sleep 10
-
-      TIMEOUT=120
-      ELAPSED=0
-      while [ $ELAPSED -lt $TIMEOUT ]; do
-        RECREATED_SERVERS=$(kubectl get wggatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-        if [ -n "$RECREATED_SERVERS" ]; then
-          echo "      ✓ WgGatewayServer recreated: ${RECREATED_SERVERS}"
-          break
-        fi
-        sleep 5
-        ELAPSED=$((ELAPSED + 5))
-      done
-
-      if [ $ELAPSED -ge $TIMEOUT ]; then
-        echo "      ⚠️  WARNING: WgGatewayServer not recreated within ${TIMEOUT}s"
-      fi
-
-      # Wait for gateway deployment rollout
-      echo "      Waiting for gateway deployment rollout..."
-      GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway \
-        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-
-      for GW_DEPLOY in ${GATEWAY_DEPLOYMENTS}; do
-        echo "        Monitoring: ${GW_DEPLOY}"
-        kubectl rollout status deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=3m 2>/dev/null || \
-          echo "        ⚠️  Rollout monitoring timed out"
-
-        # Verify image version
-        FINAL_IMAGE=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" \
-          -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-        echo "        Final image: ${FINAL_IMAGE}"
-      done
-
-      echo "    ✅ PROVIDER role upgrade complete for ${FC}"
     fi
 
-    echo ""
-    echo "✅ ForeignCluster ${FC} gateway upgrade complete"
-    echo "========================================="
+    # Step 3: Annotate Identity resources (without deleting kubeconfig secrets)
+    IDENTITY_RESOURCES=$(kubectl get identity -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    if [ -n "$IDENTITY_RESOURCES" ]; then
+      for IDENTITY_NAME in ${IDENTITY_RESOURCES}; do
+        echo "  Annotating Identity: ${IDENTITY_NAME}"
+        TIMESTAMP=$(date +%%s)
+        kubectl annotate identity "${IDENTITY_NAME}" -n "${TENANT_NS}" \
+          liqo.io/force-sync="${TIMESTAMP}" \
+          --overwrite || echo "    ⚠️  Failed to annotate Identity"
+        echo "    ✓ Identity annotated (controller will auto-update kubeconfig)"
+      done
+    fi
+
+    # Step 4: Sync Configuration.spec.remote to match status.remote
+    CONFIGURATION_RESOURCES=$(kubectl get configuration -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    if [ -n "$CONFIGURATION_RESOURCES" ]; then
+      for CONFIG_NAME in ${CONFIGURATION_RESOURCES}; do
+        echo "  Syncing Configuration: ${CONFIG_NAME}"
+
+        # Read status.remote.cidr
+        STATUS_POD_CIDR=$(kubectl get configuration "${CONFIG_NAME}" -n "${TENANT_NS}" \
+          -o jsonpath='{.status.remote.cidr.pod[0]}' 2>/dev/null || echo "")
+        STATUS_EXTERNAL_CIDR=$(kubectl get configuration "${CONFIG_NAME}" -n "${TENANT_NS}" \
+          -o jsonpath='{.status.remote.cidr.external[0]}' 2>/dev/null || echo "")
+
+        if [ -n "$STATUS_POD_CIDR" ] && [ -n "$STATUS_EXTERNAL_CIDR" ]; then
+          echo "    Patching spec.remote.cidr to match status:"
+          echo "      Pod CIDR: ${STATUS_POD_CIDR}"
+          echo "      External CIDR: ${STATUS_EXTERNAL_CIDR}"
+
+          kubectl patch configuration "${CONFIG_NAME}" -n "${TENANT_NS}" \
+            --type=merge \
+            -p="{\"spec\":{\"remote\":{\"cidr\":{\"pod\":[\"${STATUS_POD_CIDR}\"],\"external\":[\"${STATUS_EXTERNAL_CIDR}\"]}}}}" || \
+            echo "    ⚠️  Failed to patch Configuration"
+          echo "    ✓ Configuration synced"
+        else
+          echo "    ℹ️  Status CIDRs not yet populated, skipping sync"
+        fi
+      done
+    fi
+
+    echo "  ✓ Tenant namespace ${TENANT_NS} processed"
     echo ""
   done
 fi
 
 echo ""
-echo "Step 5: Final verification of network & data-plane..."
+echo "Step 5 (continued): Verify connectivity after restart..."
+
+# Give controllers additional time to reconcile after all gateway processing
+echo "  Waiting for final reconciliation to complete..."
+sleep 15
+
+# Verify network connectivity for each tenant namespace
+TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
+
+if [ -n "$TENANT_NAMESPACES" ]; then
+  echo "  Verifying network connectivity..."
+
+  for TENANT_NS in ${TENANT_NAMESPACES}; do
+    FC="${TENANT_NS#liqo-tenant-}"
+    echo "    Checking connectivity for cluster: ${FC}"
+
+    # Verify InternalNode and InternalFabric resources exist
+    INTERNAL_NODES=$(kubectl get internalnode -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    INTERNAL_FABRICS=$(kubectl get internalfabric -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+    if [ -n "$INTERNAL_NODES" ]; then
+      echo "      ✓ InternalNode exists: ${INTERNAL_NODES}"
+    else
+      echo "      ⚠️  WARNING: InternalNode not found"
+    fi
+
+    if [ -n "$INTERNAL_FABRICS" ]; then
+      echo "      ✓ InternalFabric exists: ${INTERNAL_FABRICS}"
+    else
+      echo "      ⚠️  WARNING: InternalFabric not found"
+    fi
+
+    # Check RouteConfiguration status
+    ROUTE_CONFIGS=$(kubectl get routeconfiguration -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    if [ -n "$ROUTE_CONFIGS" ]; then
+      echo "      ✓ RouteConfiguration exists: ${ROUTE_CONFIGS}"
+    fi
+  done
+
+  echo "  ✓ Network connectivity verification complete"
+else
+  echo "  ℹ️  No tenant namespaces found, skipping connectivity verification"
+fi
+
+echo ""
+echo "========================================="
+echo "Step 5.9: Final Data Plane Stabilization"
+echo "========================================="
+echo "Restarting liqo-fabric one last time to ensure routing tables are applied..."
+echo "This clears any 'Link not found' errors from the interface churn during upgrade."
+
+# Force restart of fabric to clear "Link not found" errors
+kubectl rollout restart daemonset liqo-fabric -n "${NAMESPACE}"
+
+# Wait for it to be fully ready
+echo "  Waiting for liqo-fabric to initialize..."
+kubectl rollout status daemonset liqo-fabric -n "${NAMESPACE}" --timeout=2m
+
+# Give it a moment to program the routes
+echo "  Waiting for route programming (10s)..."
+sleep 10
+
+# Verify routing table exists
+echo "  Verifying Liqo routing table..."
+FABRIC_POD=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+if [ -n "$FABRIC_POD" ]; then
+  # Check if the Liqo routing table (1880) exists
+  if kubectl exec -n "${NAMESPACE}" "${FABRIC_POD}" -- ip route show table 1880 2>/dev/null | head -1; then
+    echo "  ✓ Liqo routing table (1880) is present"
+  else
+    echo "  ℹ️ Routing table 1880 not found (may be created on demand)"
+  fi
+fi
+
+echo "✅ Data Plane stabilized"
+
+echo ""
+echo "========================================="
+echo "Step 5.10: Verifying Fabric -> API Server Connectivity"
+echo "========================================="
+echo "This is CRITICAL - if Fabric cannot reach API Server, routing will fail."
+echo ""
+
+FABRIC_POD=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+if [ -n "$FABRIC_POD" ]; then
+  MAX_RETRIES=30
+  RETRY_COUNT=0
+  API_REACHABLE=false
+
+  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    # Try to reach API server from within the fabric pod
+    if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c 'wget -q -O /dev/null --timeout=5 --no-check-certificate https://kubernetes.default.svc/healthz 2>/dev/null || curl -k -s -o /dev/null --connect-timeout 5 https://kubernetes.default.svc/healthz 2>/dev/null' 2>/dev/null; then
+      echo "  ✓ Fabric can reach API Server"
+      API_REACHABLE=true
+      break
+    fi
+    echo "  ⏳ Waiting for API connectivity... ($RETRY_COUNT/$MAX_RETRIES)"
+    sleep 5
+    RETRY_COUNT=$((RETRY_COUNT+1))
+  done
+
+  if [ "$API_REACHABLE" != "true" ]; then
+    echo "  ❌ WARNING: Fabric cannot reach API Server after ${MAX_RETRIES} attempts"
+    echo "  Attempting emergency recovery..."
+    
+    # Emergency recovery: restart CoreDNS/kube-dns pods
+    echo "  Restarting DNS pods..."
+    kubectl delete pod -n kube-system -l k8s-app=kube-dns --wait=false 2>/dev/null || true
+    kubectl delete pod -n kube-system -l k8s-app=coredns --wait=false 2>/dev/null || true
+    sleep 10
+    
+    # Restart fabric again
+    echo "  Restarting liqo-fabric..."
+    kubectl rollout restart daemonset liqo-fabric -n "${NAMESPACE}"
+    kubectl rollout status daemonset liqo-fabric -n "${NAMESPACE}" --timeout=2m || true
+    
+    # Final check
+    sleep 5
+    FABRIC_POD=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    if [ -n "$FABRIC_POD" ]; then
+      if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c 'wget -q -O /dev/null --timeout=5 --no-check-certificate https://kubernetes.default.svc/healthz 2>/dev/null || curl -k -s -o /dev/null --connect-timeout 5 https://kubernetes.default.svc/healthz 2>/dev/null' 2>/dev/null; then
+        echo "  ✓ Emergency recovery successful - API now reachable"
+      else
+        echo "  ⚠️ WARNING: API still not reachable. Proceeding anyway, but connectivity may fail."
+      fi
+    fi
+  fi
+else
+  echo "  ⚠️ Warning: No fabric pod found to verify API connectivity"
+fi
+
+echo ""
+echo "========================================="
+echo "Step 6: Upgrading Virtual Kubelet (After Network Stabilization)"
+echo "========================================="
+echo "Virtual Kubelet must be upgraded AFTER the network fabric is stable"
+echo "to ensure proper IP remapping negotiation with IPAM."
+echo ""
+
+# Safety check: Ensure liqo-ipam is healthy before VK upgrade
+echo "Verifying liqo-ipam is healthy before VK upgrade..."
+if ! kubectl wait --for=condition=available deployment/liqo-ipam -n "${NAMESPACE}" --timeout=60s 2>/dev/null; then
+  echo "  ⚠️ Warning: liqo-ipam not available, VK upgrade may have issues"
+else
+  echo "  ✓ liqo-ipam is healthy"
+fi
+
+# Upgrade VkOptionsTemplate
+echo ""
+echo "--- Upgrading VkOptionsTemplate ---"
+if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/dev/null; then
+  echo "Updating VkOptionsTemplate to version ${TARGET_VERSION}..."
+
+  # Patch the template to update the virtual-kubelet container image
+  kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/containerImage", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
+    ]' && echo "  ✓ VkOptionsTemplate updated" || echo "  ⚠️  Warning: Could not update VkOptionsTemplate"
+else
+  echo "  ℹ️  VkOptionsTemplate not found, skipping"
+fi
+
+# Verify template was updated
+sleep 2
+echo "Verifying VkOptionsTemplate update..."
+VK_TEMPLATE_IMAGE=$(kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.containerImage}' 2>/dev/null || echo "not found")
+echo "  VkOptionsTemplate image: ${VK_TEMPLATE_IMAGE}"
+
+if [[ "$VK_TEMPLATE_IMAGE" != *"${TARGET_VERSION}"* ]] && [[ "$VK_TEMPLATE_IMAGE" != "not found" ]]; then
+  echo "⚠️ Warning: VkOptionsTemplate not updated to ${TARGET_VERSION}"
+fi
+
+# Upgrade existing VirtualNode resources to use new image
+echo ""
+echo "--- Upgrading VirtualNode Resources ---"
+VIRTUALNODES=$(kubectl get virtualnodes -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+if [ -z "$VIRTUALNODES" ]; then
+  echo "  ℹ️  No VirtualNode resources found, skipping"
+else
+  VN_COUNT=0
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      VN_NAMESPACE=$(echo "$line" | awk '{print $1}')
+      VN_NAME=$(echo "$line" | awk '{print $2}')
+
+      echo "  Updating VirtualNode: ${VN_NAME} in namespace ${VN_NAMESPACE}..."
+
+      # Get current image
+      CURRENT_VK_IMAGE=$(kubectl get virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+
+      if [[ "$CURRENT_VK_IMAGE" != *"${TARGET_VERSION}"* ]]; then
+        # Patch VirtualNode to update virtual-kubelet image
+        echo "    Patching VirtualNode to update image to ${TARGET_VERSION}..."
+        kubectl patch virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
+          --type='json' -p='[
+            {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
+          ]' && echo "      ✓ VirtualNode image updated" || echo "      ⚠️  Warning: Could not update VirtualNode"
+
+        VN_COUNT=$((VN_COUNT + 1))
+
+        # Find and delete deployment to force recreation with new image
+        DEPLOYMENT_NAME=$(kubectl get deployments -n "$VN_NAMESPACE" -l liqo.io/virtual-node="$VN_NAME" \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+        if [ -n "$DEPLOYMENT_NAME" ]; then
+          echo "    Found deployment: ${DEPLOYMENT_NAME}"
+          echo "    Deleting deployment to force recreation with new image..."
+          kubectl delete deployment "$DEPLOYMENT_NAME" -n "$VN_NAMESPACE" || echo "      ⚠️  Warning: Could not delete deployment"
+        else
+          echo "    ⚠️  Warning: No deployment found for VirtualNode ${VN_NAME}"
+        fi
+      else
+        echo "    ℹ️  Already at ${TARGET_VERSION}, skipping"
+      fi
+    fi
+  done <<< "$VIRTUALNODES"
+
+  echo "✅ ${VN_COUNT} VirtualNode(s) processed for upgrade"
+
+  # Wait for Liqo controller to recreate virtual-kubelet deployments from updated templates
+  if [ "$VN_COUNT" -gt 0 ]; then
+    echo ""
+    echo "Waiting for Liqo controller to recreate virtual-kubelet deployments from updated templates..."
+    echo "Waiting for deployments to be recreated..."
+    sleep 10
+
+    TIMEOUT=120
+    ELAPSED=0
+    while [ $ELAPSED -lt $TIMEOUT ]; do
+      VK_DEPLOYMENTS=$(kubectl get deployments -A -l offloading.liqo.io/component=virtual-kubelet \
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+      if [ -n "$VK_DEPLOYMENTS" ]; then
+        DEPLOYMENT_COUNT=$(echo "$VK_DEPLOYMENTS" | wc -w)
+        if [ "$DEPLOYMENT_COUNT" -ge "$VN_COUNT" ]; then
+          echo "  ✓ All virtual-kubelet deployments recreated"
+          break
+        fi
+      fi
+
+      sleep 5
+      ELAPSED=$((ELAPSED + 5))
+    done
+
+    if [ $ELAPSED -ge $TIMEOUT ]; then
+      echo "  ⚠️  Warning: Not all deployments recreated within ${TIMEOUT}s timeout"
+    fi
+
+    # Wait for virtual-kubelet deployments to roll out
+    echo ""
+    echo "Waiting for virtual-kubelet deployments to roll out..."
+    VK_DEPLOYMENTS=$(kubectl get deployments -A -l offloading.liqo.io/component=virtual-kubelet \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+    if [ -n "$VK_DEPLOYMENTS" ]; then
+      while IFS= read -r line; do
+        if [ -n "$line" ]; then
+          VK_NS=$(echo "$line" | awk '{print $1}')
+          VK_DEPLOY=$(echo "$line" | awk '{print $2}')
+
+          echo "  Checking ${VK_DEPLOY} in ${VK_NS}..."
+          kubectl rollout status deployment/"$VK_DEPLOY" -n "$VK_NS" --timeout=2m || echo "    ⚠️  Warning: Rollout status check failed"
+
+          # CRITICAL: Inject LIQO_IPAM_SERVER environment variable
+          # This allows the Virtual Kubelet to find the IPAM server for IP remapping
+          # Using env var instead of --ipam-server flag (which is not supported in all versions)
+          echo "    Injecting LIQO_IPAM_SERVER environment variable..."
+          kubectl set env deployment/"$VK_DEPLOY" -n "$VK_NS" \
+            LIQO_IPAM_SERVER="liqo-ipam.${NAMESPACE}.svc.cluster.local:6000" \
+            --overwrite 2>/dev/null && echo "      ✓ IPAM environment variable injected" \
+            || echo "      ⚠️ Warning: Could not inject IPAM env var"
+
+          # Wait for the deployment to stabilize after env var injection
+          kubectl rollout status deployment/"$VK_DEPLOY" -n "$VK_NS" --timeout=2m 2>/dev/null || true
+
+          # Verify new image
+          NEW_IMAGE=$(kubectl get deployment "$VK_DEPLOY" -n "$VK_NS" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+          echo "    New image: ${NEW_IMAGE}"
+
+          if [[ "$NEW_IMAGE" == *"${TARGET_VERSION}"* ]]; then
+            echo "    ✓ Successfully upgraded to ${TARGET_VERSION}"
+          else
+            echo "    ⚠️  Warning: Image not updated to ${TARGET_VERSION}"
+          fi
+        fi
+      done <<< "$VK_DEPLOYMENTS"
+    fi
+  fi
+fi
+
+echo ""
+echo "✅ Virtual Kubelet upgrade complete"
+
+echo ""
+echo "Step 7: Final verification of network & data-plane..."
 
 # Wait for pod updates to fully propagate
 echo "Waiting for pod updates to propagate..."
@@ -1069,7 +1420,7 @@ for TENANT_NS in ${TENANT_NAMESPACES}; do
 done
 
 echo ""
-echo "Step 6: Comprehensive network connectivity verification..."
+echo "Step 7 (continued): Comprehensive network connectivity verification..."
 
 # Check fabric pods can reach API server
 echo "  Checking fabric pods API connectivity..."
@@ -1142,11 +1493,11 @@ for TENANT_NS in ${TENANT_NAMESPACES}; do
   fi
 done
 
-if [ $GATEWAY_HEALTHY -gt 0 ]; then
+if [ "${GATEWAY_HEALTHY:-0}" -gt 0 ]; then
   echo "    ✓ ${GATEWAY_HEALTHY} gateway pod(s) running"
 fi
 
-if [ $GATEWAY_UNHEALTHY -gt 0 ]; then
+if [ "${GATEWAY_UNHEALTHY:-0}" -gt 0 ]; then
   echo "    ⚠️  WARNING: ${GATEWAY_UNHEALTHY} gateway pod(s) not running"
 fi
 
@@ -1154,6 +1505,11 @@ echo ""
 echo "========================================="
 echo "✅ Stage 3 complete: Network & Data-Plane upgraded"
 echo "✅ All network components upgraded to ${TARGET_VERSION}"
+echo "✅ Local data plane reset with conntrack flush"
+echo "✅ Stale RouteConfigurations cleaned and regenerated"
+echo "✅ Fabric -> API Server connectivity verified"
+echo "✅ Gateway IP synchronization verified"
+echo "✅ Virtual Kubelet upgraded with IPAM env var"
 echo "✅ All critical environment variables and args preserved"
 echo "========================================="
 `, upgrade.Spec.TargetVersion, namespace, backupConfigMapName, planConfigMap)

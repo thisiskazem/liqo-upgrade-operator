@@ -17,7 +17,7 @@ rules:
 # Deployment permissions
 - apiGroups: ["apps"]
   resources: ["deployments"]
-  verbs: ["get", "list", "watch", "patch", "update", "delete"] # Added 'delete' verb
+  verbs: ["get", "list", "watch", "patch", "update", "delete"]
 
 # Deployment scale permissions (for scaling down controller-manager during gateway upgrades)
 - apiGroups: ["apps"]
@@ -74,6 +74,15 @@ rules:
   resources: ["jobs"]
   verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
 
+# =====================================================
+# NEW: Node permissions (for InternalNode regeneration)
+# =====================================================
+# Required to trigger Node reconciliation in liqo-controller-manager
+# by labeling nodes, which forces InternalNode resource recreation
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+
 # Liqo resources (for freeze operations)
 - apiGroups: ["core.liqo.io"]
   resources: ["foreignclusters"]
@@ -103,6 +112,16 @@ rules:
   resources: ["gatewayclients/status", "gatewayservers/status"]
   verbs: ["get", "patch", "update"]
 
+# Liqo InternalNode and InternalFabric resources (for network fabric state management)
+- apiGroups: ["networking.liqo.io"]
+  resources: ["internalnodes", "internalfabrics", "routeconfigurations"]
+  verbs: ["get", "list", "watch", "delete"]
+
+# Liqo Configuration resources (for CIDR sync)
+- apiGroups: ["networking.liqo.io"]
+  resources: ["configurations"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
 # Liqo authentication resources (for RBAC regeneration)
 - apiGroups: ["authentication.liqo.io"]
   resources: ["identities", "tenants"]
@@ -112,6 +131,11 @@ rules:
 - apiGroups: ["authentication.liqo.io"]
   resources: ["identities/status"]
   verbs: ["get"]
+
+# Lease permissions (for clearing gateway leader election leases)
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "delete"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
