@@ -812,8 +812,10 @@ if [ -n "$TENANT_NAMESPACES" ]; then
         # This is CRITICAL - the controller will abort if it sees 2 pods
         echo "    Waiting for old pods to terminate..."
         for TERM_WAIT in 1 2 3 4 5 6 7 8 9 10 11 12; do
-          POD_COUNT=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null | grep -v "Terminating" | grep -c "Running" || echo "0")
-          TERM_COUNT=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null | grep -c "Terminating" || echo "0")
+          POD_COUNT=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null | grep -v "Terminating" | grep -c "Running" 2>/dev/null || echo "0")
+          POD_COUNT=$(echo "$POD_COUNT" | tr -d '[:space:]')
+          TERM_COUNT=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null | grep -c "Terminating" 2>/dev/null || echo "0")
+          TERM_COUNT=$(echo "$TERM_COUNT" | tr -d '[:space:]')
           
           if [ "${TERM_COUNT}" -eq 0 ] && [ "${POD_COUNT}" -eq 1 ]; then
             echo "      ✓ Only 1 running pod, no terminating pods"
@@ -959,30 +961,33 @@ else
       done
     fi
 
-    # Step 4: Sync Configuration.spec.remote to match status.remote
+    # Step 4: Verify Configuration resources (DO NOT modify spec.remote.cidr)
+    # IMPORTANT: Configuration.spec.remote.cidr contains the ACTUAL remote cluster's CIDR
+    # Configuration.status.remote.cidr contains the REMAPPED CIDR for local use
+    # The Liqo networking controller manages these values - DO NOT overwrite spec with status!
     CONFIGURATION_RESOURCES=$(kubectl get configuration -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     if [ -n "$CONFIGURATION_RESOURCES" ]; then
       for CONFIG_NAME in ${CONFIGURATION_RESOURCES}; do
-        echo "  Syncing Configuration: ${CONFIG_NAME}"
-
-        # Read status.remote.cidr
+        echo "  Verifying Configuration: ${CONFIG_NAME}"
+        
+        # Read and display current values (for verification only)
+        SPEC_POD_CIDR=$(kubectl get configuration "${CONFIG_NAME}" -n "${TENANT_NS}" \
+          -o jsonpath='{.spec.remote.cidr.pod[0]}' 2>/dev/null || echo "")
         STATUS_POD_CIDR=$(kubectl get configuration "${CONFIG_NAME}" -n "${TENANT_NS}" \
           -o jsonpath='{.status.remote.cidr.pod[0]}' 2>/dev/null || echo "")
-        STATUS_EXTERNAL_CIDR=$(kubectl get configuration "${CONFIG_NAME}" -n "${TENANT_NS}" \
-          -o jsonpath='{.status.remote.cidr.external[0]}' 2>/dev/null || echo "")
-
-        if [ -n "$STATUS_POD_CIDR" ] && [ -n "$STATUS_EXTERNAL_CIDR" ]; then
-          echo "    Patching spec.remote.cidr to match status:"
-          echo "      Pod CIDR: ${STATUS_POD_CIDR}"
-          echo "      External CIDR: ${STATUS_EXTERNAL_CIDR}"
-
-          kubectl patch configuration "${CONFIG_NAME}" -n "${TENANT_NS}" \
-            --type=merge \
-            -p="{\"spec\":{\"remote\":{\"cidr\":{\"pod\":[\"${STATUS_POD_CIDR}\"],\"external\":[\"${STATUS_EXTERNAL_CIDR}\"]}}}}" || \
-            echo "    ⚠️  Failed to patch Configuration"
-          echo "    ✓ Configuration synced"
+        
+        echo "    spec.remote.cidr.pod: ${SPEC_POD_CIDR} (actual remote CIDR)"
+        echo "    status.remote.cidr.pod: ${STATUS_POD_CIDR} (remapped CIDR for local use)"
+        
+        if [ -n "$SPEC_POD_CIDR" ] && [ -n "$STATUS_POD_CIDR" ]; then
+          if [ "$SPEC_POD_CIDR" == "$STATUS_POD_CIDR" ]; then
+            echo "    ⚠️  WARNING: spec equals status - NAT rules may not work correctly!"
+            echo "    The spec should contain the actual remote CIDR, not the remapped one."
+          else
+            echo "    ✓ Configuration looks correct (spec != status)"
+          fi
         else
-          echo "    ℹ️  Status CIDRs not yet populated, skipping sync"
+          echo "    ℹ️  CIDRs not yet fully populated"
         fi
       done
     fi
@@ -1269,8 +1274,15 @@ else
             --overwrite 2>/dev/null && echo "      ✓ IPAM environment variable injected" \
             || echo "      ⚠️ Warning: Could not inject IPAM env var"
 
-          # Wait for the deployment to stabilize after env var injection
-          kubectl rollout status deployment/"$VK_DEPLOY" -n "$VK_NS" --timeout=2m 2>/dev/null || true
+          # CRITICAL FIX: Force pod deletion to make VK reload Configuration
+          # The VK caches Configuration at startup, so we must delete pods to force restart
+          echo "    Forcing VK pod recreation to reload Configuration..."
+          kubectl delete pods -n "$VK_NS" -l offloading.liqo.io/component=virtual-kubelet --wait=false 2>/dev/null || true
+          
+          # Wait for new pods to be ready
+          echo "    Waiting for VK pods to be recreated..."
+          sleep 10
+          kubectl rollout status deployment/"$VK_DEPLOY" -n "$VK_NS" --timeout=3m 2>/dev/null || true
 
           # Verify new image
           NEW_IMAGE=$(kubectl get deployment "$VK_DEPLOY" -n "$VK_NS" \
@@ -1290,6 +1302,37 @@ fi
 
 echo ""
 echo "✅ Virtual Kubelet upgrade complete"
+
+echo ""
+echo "========================================="
+echo "Step 6.5: Final Network Stabilization"
+echo "========================================="
+echo "Restarting liqo-fabric after VK upgrade to ensure geneve tunnels are correct..."
+
+# Force GatewayClient reconciliation to update internalEndpoint IPs
+echo "Forcing GatewayClient reconciliation..."
+TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
+for TENANT_NS in $TENANT_NAMESPACES; do
+  GATEWAY_CLIENTS=$(kubectl get gatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  for GW_CLIENT in $GATEWAY_CLIENTS; do
+    SYNC_TS=$(date +%%s)
+    kubectl annotate gatewayclient "${GW_CLIENT}" -n "${TENANT_NS}" liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
+    echo "  ✓ Triggered reconciliation for GatewayClient ${GW_CLIENT}"
+  done
+done
+
+# Wait for controller to process annotations
+sleep 5
+
+# Restart fabric to recreate geneve tunnels with correct gateway IPs
+echo "Restarting liqo-fabric to apply updated gateway endpoints..."
+kubectl rollout restart daemonset liqo-fabric -n "${NAMESPACE}"
+kubectl rollout status daemonset liqo-fabric -n "${NAMESPACE}" --timeout=2m || echo "  ⚠️ Fabric rollout timed out"
+
+# Give fabric time to establish tunnels
+sleep 10
+
+echo "✓ Final network stabilization complete"
 
 echo ""
 echo "Step 7: Final verification of network & data-plane..."
@@ -1449,7 +1492,8 @@ if [ -n "$FOREIGN_CLUSTERS" ]; then
   done
 
   # Count established connections
-  ESTABLISHED=$(kubectl get foreignclusters -o json 2>/dev/null | jq -r '.items[].status.peeringConditions[] | select(.type=="NetworkStatus" and .status=="True")' | wc -l || echo "0")
+  ESTABLISHED=$(kubectl get foreignclusters -o json 2>/dev/null | jq -r '.items[] | select(.status.peeringConditions != null) | .status.peeringConditions[] | select(.type=="NetworkStatus" and .status=="True")' 2>/dev/null | wc -l || echo "0")
+  ESTABLISHED=$(echo "$ESTABLISHED" | tr -d '[:space:]')
   if [ "$ESTABLISHED" -gt 0 ]; then
     echo "    ✓ ${ESTABLISHED} ForeignCluster(s) with network connectivity"
   else
@@ -1463,7 +1507,8 @@ fi
 if [ -n "$FABRIC_PODS" ]; then
   echo "  Checking tunnel interfaces..."
   FABRIC_POD=$(echo "$FABRIC_PODS" | awk '{print $1}')
-  TUNNEL_COUNT=$(kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- ip link show type geneve 2>/dev/null | grep -c "geneve" || echo "0")
+  TUNNEL_COUNT=$(kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- ip link show type geneve 2>/dev/null | grep -c "geneve" 2>/dev/null || echo "0")
+  TUNNEL_COUNT=$(echo "$TUNNEL_COUNT" | tr -d '[:space:]')
   if [ "$TUNNEL_COUNT" -gt 0 ]; then
     echo "    ✓ Found ${TUNNEL_COUNT} tunnel interface(s)"
   else

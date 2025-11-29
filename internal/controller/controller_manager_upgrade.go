@@ -101,12 +101,10 @@ func (r *LiqoUpgradeReconciler) monitorControllerManagerUpgrade(ctx context.Cont
 
 	if job.Status.Succeeded > 0 {
 		logger.Info("Stage 2 completed: liqo-controller-manager upgraded successfully")
-		statusUpdates := map[string]interface{}{
-			"lastSuccessfulPhase": upgradev1alpha1.PhaseControllerManager,
-		}
-		if _, err := r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseControllerManager, "Controller-manager upgraded", statusUpdates); err != nil {
-			return ctrl.Result{}, err
-		}
+		// Set lastSuccessfulPhase in memory - it will be persisted by startNetworkFabricUpgrade
+		// Don't update status here to avoid race condition between PhaseControllerManager and PhaseNetworkFabric
+		upgrade.Status.LastSuccessfulPhase = upgradev1alpha1.PhaseControllerManager
+		// Directly transition to NetworkFabric phase (this will persist the status)
 		return r.startNetworkFabricUpgrade(ctx, upgrade)
 	}
 

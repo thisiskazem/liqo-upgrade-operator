@@ -104,6 +104,14 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 	}
 	logger.Info("Compatibility check passed", "from", minimumVersion, "to", upgrade.Spec.TargetVersion)
 
+	// Step 5.5: Ensure target descriptors exist for both current and target versions
+	// This dynamically generates descriptors from Helm charts if they don't exist
+	logger.Info("Step 5.5: Ensuring target descriptors are generated")
+	if err := r.ensureTargetDescriptors(ctx, upgrade, localVersion, upgrade.Spec.TargetVersion, namespace); err != nil {
+		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to ensure target descriptors: %v", err))
+	}
+	logger.Info("Target descriptors ensured for both versions", "currentVersion", localVersion, "targetVersion", upgrade.Spec.TargetVersion)
+
 	// Step 6: Load target version descriptor
 	logger.Info("Step 6: Loading target version descriptor")
 	targetDescriptor, err := r.loadTargetDescriptor(ctx, upgrade.Spec.TargetVersion, namespace)
