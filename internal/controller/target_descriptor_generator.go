@@ -183,7 +183,7 @@ func (r *LiqoUpgradeReconciler) waitForGeneratorJob(ctx context.Context, jobName
 // buildTargetDescriptorGeneratorJob creates the Job that generates target descriptors using Helm
 func (r *LiqoUpgradeReconciler) buildTargetDescriptorGeneratorJob(upgrade *upgradev1alpha1.LiqoUpgrade, version, namespace, jobName string) *batchv1.Job {
 	backoffLimit := int32(3)
-	ttlSeconds := int32(3600) // Clean up after 1 hour
+	ttlSeconds := int32(300) // Clean up after 5 minutes (same as other upgrade jobs)
 
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
@@ -217,17 +217,24 @@ if ! command -v kubectl &> /dev/null; then
 fi
 echo "✓ All required tools are available"
 
-# Clone Liqo repo at specific version
+# Clone only deployments/liqo folder using sparse checkout
 echo ""
-echo "Fetching Liqo Helm chart for ${VERSION}..."
-git clone --depth 1 --branch "${VERSION}" https://github.com/liqotech/liqo.git 2>/dev/null || {
-  echo "Trying full clone with checkout..."
-  git clone https://github.com/liqotech/liqo.git
+echo "Fetching Liqo Helm chart for ${VERSION} (sparse checkout)..."
+git clone --filter=blob:none --sparse --depth 1 --branch "${VERSION}" https://github.com/liqotech/liqo.git 2>/dev/null && {
   cd liqo
-  git checkout "${VERSION}"
-  cd ..
+  git sparse-checkout set deployments/liqo
+} || {
+  echo "Sparse clone failed, trying manual sparse checkout..."
+  rm -rf liqo 2>/dev/null
+  mkdir -p liqo && cd liqo
+  git init -q
+  git remote add origin https://github.com/liqotech/liqo.git
+  git sparse-checkout init --cone
+  git sparse-checkout set deployments/liqo
+  git fetch --depth 1 origin "${VERSION}"
+  git checkout FETCH_HEAD -q
 }
-cd liqo
+cd "${WORK_DIR}/liqo"
 
 echo "✓ Liqo repository cloned at ${VERSION}"
 

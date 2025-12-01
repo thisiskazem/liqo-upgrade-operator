@@ -240,7 +240,16 @@ if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${TARGET_VERSION}"'"},
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${TARGET_VERSION}"'"},
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ WgGatewayClientTemplate updated" || echo "  ⚠️  Warning: Could not update WgGatewayClientTemplate"
+    ]' && echo "  ✓ WgGatewayClientTemplate images updated" || echo "  ⚠️  Warning: Could not update WgGatewayClientTemplate images"
+  
+  # Update version labels in template
+  kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"}
+    ]' && echo "  ✓ WgGatewayClientTemplate labels updated" || echo "  ⚠️  Warning: Could not update WgGatewayClientTemplate labels"
 else
   echo "  ℹ️  WgGatewayClientTemplate not found, skipping"
 fi
@@ -255,7 +264,16 @@ if kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" &>/dev
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${TARGET_VERSION}"'"},
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${TARGET_VERSION}"'"},
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ WgGatewayServerTemplate updated" || echo "  ⚠️  Warning: Could not update WgGatewayServerTemplate"
+    ]' && echo "  ✓ WgGatewayServerTemplate images updated" || echo "  ⚠️  Warning: Could not update WgGatewayServerTemplate images"
+  
+  # Update version labels in template
+  kubectl patch wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"}
+    ]' && echo "  ✓ WgGatewayServerTemplate labels updated" || echo "  ⚠️  Warning: Could not update WgGatewayServerTemplate labels"
 else
   echo "  ℹ️  WgGatewayServerTemplate not found, skipping"
 fi
@@ -311,6 +329,34 @@ check_component_health() {
   fi
 }
 
+# Function to update version labels on a Deployment or DaemonSet
+update_version_labels() {
+  local COMPONENT=$1
+  local KIND=$2
+  local NAMESPACE=$3
+  local TARGET_VERSION=$4
+  
+  echo "  Updating version labels for ${COMPONENT}..."
+  
+  local RESOURCE_TYPE=$(echo "$KIND" | tr '[:upper:]' '[:lower:]')
+  
+  # Update metadata labels
+  kubectl patch "${RESOURCE_TYPE}" "${COMPONENT}" -n "${NAMESPACE}" --type=json \
+    -p='[
+      {"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+      {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+    ]' 2>/dev/null || echo "    ⚠️ Could not update metadata labels"
+  
+  # Update pod template labels
+  kubectl patch "${RESOURCE_TYPE}" "${COMPONENT}" -n "${NAMESPACE}" --type=json \
+    -p='[
+      {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+      {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+    ]' 2>/dev/null || echo "    ⚠️ Could not update pod template labels"
+  
+  echo "    ✓ Labels updated"
+}
+
 # Upgrade liqo-ipam first (less critical, manages IP allocation)
 if kubectl get deployment liqo-ipam -n "${NAMESPACE}" &>/dev/null; then
   echo ""
@@ -348,6 +394,9 @@ if kubectl get deployment liqo-ipam -n "${NAMESPACE}" &>/dev/null; then
     echo "❌ ERROR: liqo-ipam health check failed!"
     exit 1
   }
+  
+  # Update version labels
+  update_version_labels "liqo-ipam" "Deployment" "${NAMESPACE}" "${TARGET_VERSION}"
 fi
 
 # Upgrade liqo-proxy (Deployment)
@@ -387,6 +436,9 @@ if kubectl get deployment liqo-proxy -n "${NAMESPACE}" &>/dev/null; then
     echo "❌ ERROR: liqo-proxy health check failed!"
     exit 1
   }
+  
+  # Update version labels
+  update_version_labels "liqo-proxy" "Deployment" "${NAMESPACE}" "${TARGET_VERSION}"
 fi
 
 # Upgrade liqo-fabric (DaemonSet) - Data plane component
@@ -439,6 +491,9 @@ if kubectl get daemonset liqo-fabric -n "${NAMESPACE}" &>/dev/null; then
   else
     echo "    ⚠️  WARNING: Could not verify network routes"
   fi
+  
+  # Update version labels
+  update_version_labels "liqo-fabric" "DaemonSet" "${NAMESPACE}" "${TARGET_VERSION}"
 fi
 
 # Upgrade virtual-kubelet components (if present)
@@ -1459,6 +1514,20 @@ for TENANT_NS in ${TENANT_NAMESPACES}; do
     fi
 
     echo "    ✓ All containers on target version"
+    
+    # Update version labels for gateway deployment
+    echo "    Updating version labels..."
+    kubectl patch deployment "${GW}" -n "${TENANT_NS}" --type=json \
+      -p='[
+        {"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+        {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+      ]' 2>/dev/null || echo "      ⚠️ Could not update metadata labels"
+    kubectl patch deployment "${GW}" -n "${TENANT_NS}" --type=json \
+      -p='[
+        {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+        {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+      ]' 2>/dev/null || echo "      ⚠️ Could not update pod template labels"
+    echo "    ✓ Labels updated"
   done
 done
 

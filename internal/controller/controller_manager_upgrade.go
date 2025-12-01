@@ -566,13 +566,84 @@ EOF
   return 0
 }
 
+# Function to update version labels on a Deployment
+update_deployment_labels() {
+  local COMPONENT_NAME=$1
+  local NAMESPACE=$2
+  local TARGET_VERSION=$3
+  
+  echo "  Updating version labels for ${COMPONENT_NAME}..."
+  
+  # Update metadata labels
+  kubectl patch deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" --type=json \
+    -p='[
+      {"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+      {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+    ]' 2>/dev/null || echo "    ⚠️ Could not update metadata labels"
+  
+  # Update pod template labels
+  kubectl patch deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" --type=json \
+    -p='[
+      {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+      {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+    ]' 2>/dev/null || echo "    ⚠️ Could not update pod template labels"
+  
+  echo "    ✓ Labels updated"
+}
+
 # Upgrade each core component
 for component in "${CORE_COMPONENTS[@]}"; do
   if ! upgrade_component "$component"; then
     echo "❌ ERROR: Failed to upgrade $component"
     exit 1
   fi
+  # Update version labels
+  update_deployment_labels "$component" "${NAMESPACE}" "${TARGET_VERSION}"
 done
+
+echo ""
+echo "========================================="
+echo "Upgrading: liqo-metric-agent init container (cert-creator)"
+echo "========================================="
+
+if kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" > /dev/null 2>&1; then
+  # Check if init container exists
+  INIT_CONTAINER_EXISTS=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.template.spec.initContainers[0].name}' 2>/dev/null || echo "")
+
+  if [ -n "$INIT_CONTAINER_EXISTS" ]; then
+    echo "Init container found: ${INIT_CONTAINER_EXISTS}"
+    
+    CURRENT_INIT_IMAGE=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" \
+      -o jsonpath='{.spec.template.spec.initContainers[0].image}' 2>/dev/null || echo "")
+    echo "Current init container image: ${CURRENT_INIT_IMAGE}"
+    
+    NEW_INIT_IMAGE="ghcr.io/liqotech/cert-creator:${TARGET_VERSION}"
+    echo "Target init container image: ${NEW_INIT_IMAGE}"
+    
+    # Patch init container image
+    kubectl patch deployment liqo-metric-agent -n "${NAMESPACE}" --type=json \
+      -p='[{"op": "replace", "path": "/spec/template/spec/initContainers/0/image", "value": "'"${NEW_INIT_IMAGE}"'"}]'
+    
+    echo "Waiting for rollout after init container update..."
+    kubectl rollout status deployment/liqo-metric-agent -n "${NAMESPACE}" --timeout=3m
+    
+    # Verify init container was updated
+    UPDATED_INIT_IMAGE=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" \
+      -o jsonpath='{.spec.template.spec.initContainers[0].image}' 2>/dev/null || echo "")
+    echo "Updated init container image: ${UPDATED_INIT_IMAGE}"
+    
+    if [[ "$UPDATED_INIT_IMAGE" == *"${TARGET_VERSION}"* ]]; then
+      echo "✅ cert-creator init container upgraded successfully"
+    else
+      echo "⚠️  WARNING: Init container may not have been updated to target version"
+    fi
+  else
+    echo "ℹ️  No init container found in liqo-metric-agent, skipping"
+  fi
+else
+  echo "ℹ️  liqo-metric-agent not found, skipping init container upgrade"
+fi
 
 echo "========================================="
 echo "Upgrading: liqo-webhook (with TLS validation)"
@@ -640,10 +711,156 @@ if kubectl get deployment liqo-webhook -n "${NAMESPACE}" > /dev/null 2>&1; then
   echo "  Webhook should be processing admission requests"
   echo "  Check API server logs if issues occur"
 
+  # Update version labels for webhook
+  update_deployment_labels "liqo-webhook" "${NAMESPACE}" "${TARGET_VERSION}"
+  
   echo ""
   echo "✅ liqo-webhook upgraded successfully"
 else
   echo "⚠️  liqo-webhook deployment not found, skipping"
+fi
+
+echo ""
+echo "========================================="
+echo "Upgrading: liqo-telemetry (CronJob)"
+echo "========================================="
+
+TELEMETRY_EXISTS=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" --ignore-not-found -o name)
+echo "DEBUG: TELEMETRY_EXISTS=${TELEMETRY_EXISTS}"
+
+if [ -n "${TELEMETRY_EXISTS}" ]; then
+  echo "Found liqo-telemetry CronJob"
+  
+  CURRENT_TELEMETRY_IMAGE=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}')
+  echo "Current image: ${CURRENT_TELEMETRY_IMAGE}"
+  
+  NEW_TELEMETRY_IMAGE="ghcr.io/liqotech/telemetry:${TARGET_VERSION}"
+  echo "Target image: ${NEW_TELEMETRY_IMAGE}"
+  
+  # Step 1: Update image using JSON patch
+  echo "Step 1: Updating container image with JSON patch..."
+  
+  kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type='json' \
+    -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/image","value":"'"${NEW_TELEMETRY_IMAGE}"'"}]'
+  PATCH_RESULT=$?
+  echo "DEBUG: Image patch exit code: ${PATCH_RESULT}"
+  
+  if [ ${PATCH_RESULT} -ne 0 ]; then
+    echo "  ❌ ERROR: Failed to patch CronJob image"
+    # Don't exit, continue to verify
+  else
+    echo "  ✓ Image patch command succeeded"
+  fi
+  
+  # Step 2: Update --liqo-version arg
+  echo "Step 2: Updating --liqo-version arg..."
+  
+  # Get current args and find the index of --liqo-version
+  CURRENT_ARGS=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].args[*]}')
+  echo "  Current args: ${CURRENT_ARGS}"
+  
+  # Find which index has --liqo-version (usually index 0)
+  ARG_INDEX=0
+  for i in 0 1 2 3 4 5; do
+    ARG_VAL=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
+      -o jsonpath="{.spec.jobTemplate.spec.template.spec.containers[0].args[${i}]}" 2>/dev/null || echo "")
+    if [[ "${ARG_VAL}" == --liqo-version=* ]]; then
+      ARG_INDEX=${i}
+      echo "  Found --liqo-version at index ${ARG_INDEX}"
+      break
+    fi
+  done
+  
+  kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type='json' \
+    -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/args/'"${ARG_INDEX}"'","value":"--liqo-version='"${TARGET_VERSION}"'"}]'
+  ARGS_RESULT=$?
+  echo "DEBUG: Args patch exit code: ${ARGS_RESULT}"
+  
+  if [ ${ARGS_RESULT} -ne 0 ]; then
+    echo "  ⚠️  WARNING: Failed to patch --liqo-version arg"
+  else
+    echo "  ✓ Args patch command succeeded"
+  fi
+  
+  # Verify CronJob was updated
+  echo ""
+  echo "Verifying updates..."
+  sleep 2
+  
+  UPDATED_TELEMETRY_IMAGE=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}')
+  UPDATED_ARG=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
+    -o jsonpath="{.spec.jobTemplate.spec.template.spec.containers[0].args[${ARG_INDEX}]}")
+  
+  echo "  Updated image: ${UPDATED_TELEMETRY_IMAGE}"
+  echo "  Updated --liqo-version arg: ${UPDATED_ARG}"
+  
+  if [[ "${UPDATED_TELEMETRY_IMAGE}" == *"${TARGET_VERSION}"* ]]; then
+    echo "✅ liqo-telemetry CronJob image upgraded successfully"
+  else
+    echo "❌ ERROR: liqo-telemetry image was not updated to target version"
+    echo "  Expected: ${NEW_TELEMETRY_IMAGE}"
+    echo "  Got: ${UPDATED_TELEMETRY_IMAGE}"
+  fi
+  
+  if [[ "${UPDATED_ARG}" == *"${TARGET_VERSION}"* ]]; then
+    echo "✅ liqo-telemetry --liqo-version arg updated successfully"
+  else
+    echo "⚠️  WARNING: --liqo-version arg may not have been updated"
+  fi
+  
+  # Step 3: Update version labels for CronJob
+  echo ""
+  echo "Step 3: Updating version labels..."
+  
+  # Update metadata labels
+  kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
+    -p='[
+      {"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+      {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+    ]' 2>/dev/null && echo "  ✓ Metadata labels updated" || echo "  ⚠️ Could not update metadata labels"
+  
+  # Update pod template labels
+  kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
+    -p='[
+      {"op":"replace","path":"/spec/jobTemplate/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${TARGET_VERSION}"'"},
+      {"op":"replace","path":"/spec/jobTemplate/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${TARGET_VERSION}"'"}
+    ]' 2>/dev/null && echo "  ✓ Pod template labels updated" || echo "  ⚠️ Could not update pod template labels"
+  
+  echo ""
+  echo "Note: Next scheduled job will use the new image and version"
+else
+  echo "ℹ️  liqo-telemetry CronJob not found, skipping"
+fi
+
+echo ""
+echo "========================================="
+echo "Fixing: liqo-telemetry RBAC (Known Liqo Bug)"
+echo "========================================="
+echo "The liqo-telemetry ClusterRole is missing create/update permissions for configmaps."
+echo "This is a bug in Liqo's Helm chart that we fix during upgrade."
+
+if kubectl get clusterrole liqo-telemetry &>/dev/null; then
+  echo "Patching liqo-telemetry ClusterRole to add create/update permissions for configmaps..."
+  
+  kubectl patch clusterrole liqo-telemetry --type='json' \
+    -p='[{"op":"replace","path":"/rules/0/verbs","value":["get","list","watch","create","update"]}]' \
+    && echo "  ✓ liqo-telemetry ClusterRole patched successfully" \
+    || echo "  ⚠️ Warning: Could not patch liqo-telemetry ClusterRole"
+  
+  # Verify the patch
+  CONFIGMAP_VERBS=$(kubectl get clusterrole liqo-telemetry -o jsonpath='{.rules[0].verbs}' 2>/dev/null || echo "")
+  echo "  Current configmap verbs: ${CONFIGMAP_VERBS}"
+  
+  if echo "${CONFIGMAP_VERBS}" | grep -q "create"; then
+    echo "✅ liqo-telemetry RBAC fix applied successfully"
+  else
+    echo "⚠️ Warning: RBAC fix may not have been applied correctly"
+  fi
+else
+  echo "ℹ️  liqo-telemetry ClusterRole not found, skipping RBAC fix"
 fi
 
 echo ""
@@ -675,6 +892,18 @@ if [ "$ALL_HEALTHY" != "true" ]; then
   exit 1
 fi
 
+# Check CronJob health
+echo ""
+echo "Checking CronJob status..."
+if kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" > /dev/null 2>&1; then
+  CRONJOB_SUSPENDED=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" -o jsonpath='{.spec.suspend}' 2>/dev/null || echo "false")
+  if [ "$CRONJOB_SUSPENDED" == "true" ]; then
+    echo "  ⚠️  liqo-telemetry CronJob is suspended"
+  else
+    echo "  ✓ liqo-telemetry CronJob is active"
+  fi
+fi
+
 echo ""
 echo "Checking controller CRD reconciliation..."
 # Give controllers time to reconcile
@@ -698,8 +927,9 @@ echo ""
 echo "Summary:"
 echo "  - liqo-controller-manager: upgraded"
 echo "  - liqo-crd-replicator: upgraded"
-echo "  - liqo-metric-agent: upgraded"
+echo "  - liqo-metric-agent: upgraded (including cert-creator init container)"
 echo "  - liqo-webhook: upgraded with TLS validation"
+echo "  - liqo-telemetry: CronJob upgraded"
 echo "  - Post-rollout health: verified"
 `, upgrade.Spec.TargetVersion, namespace, planConfigMap)
 

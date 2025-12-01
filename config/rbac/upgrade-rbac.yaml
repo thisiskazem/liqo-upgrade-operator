@@ -44,10 +44,10 @@ rules:
   resources: ["replicasets"]
   verbs: ["get", "list", "watch"]
 
-# Pod permissions
+# Pod permissions (includes create/update for RBAC escalation when patching liqo-telemetry ClusterRole)
 - apiGroups: [""]
   resources: ["pods", "pods/log"]
-  verbs: ["get", "list", "watch", "delete"]
+  verbs: ["get", "list", "watch", "create", "update", "delete"]
 
 # Pod exec permissions (for network verification)
 - apiGroups: [""]
@@ -74,14 +74,20 @@ rules:
   resources: ["jobs"]
   verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
 
+# CronJob permissions (for liqo-telemetry upgrade)
+- apiGroups: ["batch"]
+  resources: ["cronjobs"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+
 # =====================================================
 # NEW: Node permissions (for InternalNode regeneration)
 # =====================================================
 # Required to trigger Node reconciliation in liqo-controller-manager
 # by labeling nodes, which forces InternalNode resource recreation
+# Includes create for RBAC escalation when patching liqo-telemetry ClusterRole
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get", "list", "watch", "update", "patch"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
 
 # Liqo resources (for freeze operations)
 - apiGroups: ["core.liqo.io"]
@@ -127,6 +133,11 @@ rules:
   resources: ["identities", "tenants"]
   verbs: ["get", "list", "watch", "patch", "update"]
 
+# Liqo resourceslices (required for RBAC escalation when patching liqo-telemetry ClusterRole)
+- apiGroups: ["authentication.liqo.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch"]
+
 # Liqo authentication status subresources (for accessing kubeconfig secret refs)
 - apiGroups: ["authentication.liqo.io"]
   resources: ["identities/status"]
@@ -141,6 +152,11 @@ rules:
 - apiGroups: ["admissionregistration.k8s.io"]
   resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
   verbs: ["get", "list", "watch"]
+
+# ClusterRole permissions (for fixing Liqo RBAC bugs like liqo-telemetry)
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles"]
+  verbs: ["get", "list", "patch", "update"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
