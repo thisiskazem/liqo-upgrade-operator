@@ -951,13 +951,59 @@ if [ -n "$TENANT_NAMESPACES" ]; then
     done
 
     echo "  ✓ ${TENANT_NS} processed"
+    
+    # =========================================
+    # CANARY VERIFICATION: Verify this peering before proceeding to next
+    # =========================================
+    echo ""
+    echo "  🐦 CANARY: Verifying peering connectivity for ${TENANT_NS}..."
+    FC_NAME="${TENANT_NS#liqo-tenant-}"
+    CANARY_TIMEOUT=120
+    CANARY_VERIFIED=false
+    
+    for CANARY_ATTEMPT in $(seq 1 $((CANARY_TIMEOUT/5))); do
+      # Check ForeignCluster NetworkStatus condition
+      NETWORK_STATUS=$(kubectl get foreigncluster "${FC_NAME}" \
+        -o jsonpath='{.status.peeringConditions[?(@.type=="NetworkStatus")].status}' 2>/dev/null || echo "")
+      
+      # Also check if gateway pod is ready
+      GW_READY=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway \
+        --field-selector=status.phase=Running -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+      
+      if [ "$NETWORK_STATUS" == "True" ] && [ "$GW_READY" == "true" ]; then
+        echo "    ✓ CANARY PASSED: Peering ${FC_NAME} verified"
+        echo "      - ForeignCluster NetworkStatus: True"
+        echo "      - Gateway pod ready: true"
+        CANARY_VERIFIED=true
+        break
+      fi
+      
+      echo "    ⏳ CANARY: Waiting for connectivity... (${CANARY_ATTEMPT}/$((CANARY_TIMEOUT/5))) NetworkStatus=${NETWORK_STATUS} GatewayReady=${GW_READY}"
+      sleep 5
+    done
+    
+    if [ "$CANARY_VERIFIED" != "true" ]; then
+      echo ""
+      echo "  ❌ CANARY FAILED: Peering ${FC_NAME} did not establish connectivity within ${CANARY_TIMEOUT}s!"
+      echo "  Debug information:"
+      echo "    ForeignCluster status:"
+      kubectl get foreigncluster "${FC_NAME}" -o jsonpath='{range .status.peeringConditions[*]}    {.type}: {.status} ({.reason}){"\n"}{end}' 2>/dev/null || echo "    (could not fetch)"
+      echo "    Gateway pods:"
+      kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null || echo "    (none found)"
+      echo ""
+      echo "  Stopping canary upgrade - remaining peerings will NOT be upgraded."
+      echo "  Rollback will be triggered to restore this peering to previous version."
+      exit 1
+    fi
+    
+    echo "  🐦 CANARY: Peering ${FC_NAME} upgrade verified, proceeding to next peering..."
     echo ""
   done
 else
   echo "  ℹ️ No tenant namespaces found, skipping gateway processing"
 fi
 
-echo "✅ Gateway Stabilization complete"
+echo "✅ Gateway Stabilization complete (all peerings canary-verified)"
 
 echo ""
 echo "--- Upgrading liqo-gateway deployments ---"
