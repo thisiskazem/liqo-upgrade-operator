@@ -33,10 +33,13 @@ import (
 	upgradev1alpha1 "github.com/thisiskazem/liqo-upgrade-controller/api/v1alpha1"
 )
 
-// Rollback
+// Rollback - Cumulative rollback strategy:
+// - CRD phase fails → Rollback CRDs only
+// - Core Control Plane fails → Rollback Core + CRDs
+// - Network Fabric fails → Rollback Network + Core + CRDs
 func (r *LiqoUpgradeReconciler) startRollback(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, reason string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Starting rollback", "reason", reason)
+	logger.Info("Starting cumulative rollback", "reason", reason, "failedPhase", upgrade.Status.Phase)
 
 	// Check if autoRollback is disabled
 	if upgrade.Spec.AutoRollback != nil && !*upgrade.Spec.AutoRollback {
@@ -107,164 +110,408 @@ func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUp
 		namespace = "liqo"
 	}
 
+	// Determine which phase failed to decide rollback scope
+	failedPhase := string(upgrade.Status.Phase)
+
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
 
 echo "========================================="
-echo "Rolling back to version %s"
+echo "CUMULATIVE ROLLBACK TO VERSION %s"
 echo "========================================="
+echo ""
+echo "Failed Phase: %s"
+echo "Previous Version: %s"
+echo ""
 
 PREVIOUS_VERSION="%s"
 NAMESPACE="%s"
+FAILED_PHASE="%s"
 
-echo "Step 1: Rolling back liqo-controller-manager image..."
-PREVIOUS_IMAGE="ghcr.io/liqotech/liqo-controller-manager:${PREVIOUS_VERSION}"
-echo "Previous image: ${PREVIOUS_IMAGE}"
+# Determine rollback scope based on failed phase
+# Cumulative rollback: always rollback from the failed phase down to CRDs
+ROLLBACK_NETWORK=false
+ROLLBACK_CORE=false
+ROLLBACK_CRDS=false
 
-kubectl set image deployment/liqo-controller-manager \
-  controller-manager="${PREVIOUS_IMAGE}" \
-  -n "${NAMESPACE}"
+case "$FAILED_PHASE" in
+  "UpgradingNetworkFabric"|"PhaseNetworkFabric")
+    echo "Scope: Network Fabric + Core Control Plane + CRDs"
+    ROLLBACK_NETWORK=true
+    ROLLBACK_CORE=true
+    ROLLBACK_CRDS=true
+    ;;
+  "UpgradingControllerManager"|"PhaseControllerManager")
+    echo "Scope: Core Control Plane + CRDs"
+    ROLLBACK_CORE=true
+    ROLLBACK_CRDS=true
+    ;;
+  "UpgradingCRDs"|"PhaseCRDs")
+    echo "Scope: CRDs only"
+    ROLLBACK_CRDS=true
+    ;;
+  *)
+    echo "Unknown phase: ${FAILED_PHASE}, performing full rollback"
+    ROLLBACK_NETWORK=true
+    ROLLBACK_CORE=true
+    ROLLBACK_CRDS=true
+    ;;
+esac
 
 echo ""
-echo "Step 2: Waiting for rollback rollout..."
-if ! kubectl rollout status deployment/liqo-controller-manager -n "${NAMESPACE}" --timeout=5m; then
-  echo "❌ ERROR: Rollback rollout failed!"
-  exit 1
-fi
 
-echo ""
-echo "Step 3: Verifying rollback health..."
-if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-controller-manager -n "${NAMESPACE}"; then
-  echo "❌ ERROR: Deployment not healthy after rollback!"
-  exit 1
-fi
-
-echo ""
-echo "Step 4: Verifying version rollback..."
-DEPLOYED_VERSION=$(kubectl get deployment liqo-controller-manager -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' | cut -d: -f2)
-echo "Deployed version after rollback: ${DEPLOYED_VERSION}"
-
-if [ "${DEPLOYED_VERSION}" != "${PREVIOUS_VERSION}" ]; then
-  echo "❌ ERROR: Version mismatch after rollback!"
-  exit 1
-fi
-
-# Rollback CRDs if needed (based on lastSuccessfulPhase)
-LAST_PHASE="%s"
-
-if [ "$LAST_PHASE" = "UpgradingNetworkFabric" ]; then
+#############################################
+# PHASE 1: ROLLBACK NETWORK FABRIC (if needed)
+#############################################
+if [ "$ROLLBACK_NETWORK" = "true" ]; then
+  echo "========================================="
+  echo "PHASE 1: Rolling back Network Fabric"
+  echo "========================================="
   echo ""
-  echo "Step 5: Rolling back network fabric components..."
 
   # Find all liqo-tenant-* namespaces for gateway deployments
   TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
-  echo "  Found tenant namespaces: ${TENANT_NAMESPACES}"
+  echo "Found tenant namespaces: ${TENANT_NAMESPACES:-none}"
 
-  # Rollback gateway resources in tenant namespaces first
-  echo "  Rolling back gateway resources in tenant namespaces..."
+  # Rollback gateway resources in tenant namespaces
   GATEWAY_COUNT=0
 
   for TENANT_NS in ${TENANT_NAMESPACES}; do
-    echo "    Processing tenant namespace: ${TENANT_NS}"
+    echo ""
+    echo "Processing tenant namespace: ${TENANT_NS}"
+
+    # Rollback WgGatewayClientTemplate resources
+    WGGW_CLIENT_TEMPLATES=$(kubectl get wggatewayclienttemplate -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for TEMPLATE in ${WGGW_CLIENT_TEMPLATES}; do
+      echo "  Rolling back WgGatewayClientTemplate: ${TEMPLATE}"
+      kubectl patch wggatewayclienttemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' -p='[
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
+      ]' 2>/dev/null || echo "    Warning: Could not patch template"
+    done
+
+    # Rollback WgGatewayServerTemplate resources
+    WGGW_SERVER_TEMPLATES=$(kubectl get wggatewayservertemplate -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for TEMPLATE in ${WGGW_SERVER_TEMPLATES}; do
+      echo "  Rolling back WgGatewayServerTemplate: ${TEMPLATE}"
+      kubectl patch wggatewayservertemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' -p='[
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
+      ]' 2>/dev/null || echo "    Warning: Could not patch template"
+    done
 
     # Rollback wggatewayclient resources
     WGGW_CLIENTS=$(kubectl get wggatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     for WGGW_CLIENT in ${WGGW_CLIENTS}; do
-      echo "      Rolling back wggatewayclient: ${WGGW_CLIENT}"
+      echo "  Rolling back wggatewayclient: ${WGGW_CLIENT}"
       GATEWAY_COUNT=$((GATEWAY_COUNT + 1))
 
       kubectl patch wggatewayclient "${WGGW_CLIENT}" -n "${TENANT_NS}" --type='json' -p='[
         {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"}
-      ]' 2>/dev/null || echo "        Warning: Could not patch wggatewayclient"
+      ]' 2>/dev/null || echo "    Warning: Could not patch wggatewayclient"
     done
 
     # Rollback wggatewayserver resources
     WGGW_SERVERS=$(kubectl get wggatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     for WGGW_SERVER in ${WGGW_SERVERS}; do
-      echo "      Rolling back wggatewayserver: ${WGGW_SERVER}"
+      echo "  Rolling back wggatewayserver: ${WGGW_SERVER}"
       GATEWAY_COUNT=$((GATEWAY_COUNT + 1))
 
       kubectl patch wggatewayserver "${WGGW_SERVER}" -n "${TENANT_NS}" --type='json' -p='[
         {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"}
-      ]' 2>/dev/null || echo "        Warning: Could not patch wggatewayserver"
+      ]' 2>/dev/null || echo "    Warning: Could not patch wggatewayserver"
     done
 
-    # Also rollback deployments directly as fallback
+    # Rollback gateway deployments directly as fallback
     GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
-
     for GW in ${GATEWAY_DEPLOYMENTS}; do
-      echo "      Rolling back gateway deployment: ${GW}"
-
+      echo "  Rolling back gateway deployment: ${GW}"
       kubectl set image deployment/"${GW}" \
         gateway=ghcr.io/liqotech/gateway:${PREVIOUS_VERSION} \
         wireguard=ghcr.io/liqotech/gateway/wireguard:${PREVIOUS_VERSION} \
         geneve=ghcr.io/liqotech/gateway/geneve:${PREVIOUS_VERSION} \
-        -n "${TENANT_NS}" 2>/dev/null || echo "        Warning: Could not update deployment"
-
-      kubectl rollout status deployment/"${GW}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "        Warning: Rollout did not complete"
+        -n "${TENANT_NS}" 2>/dev/null || echo "    Warning: Could not update deployment"
+      kubectl rollout status deployment/"${GW}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "    Warning: Rollout did not complete"
     done
   done
 
-  if [ ${GATEWAY_COUNT} -gt 0 ]; then
-    echo "    ✅ ${GATEWAY_COUNT} gateway resource(s) rolled back"
-  fi
+  echo ""
+  echo "Gateway resources rolled back: ${GATEWAY_COUNT}"
 
-  # Rollback core network components
+  # Rollback liqo-ipam
   if kubectl get deployment liqo-ipam -n "${NAMESPACE}" &>/dev/null; then
-    echo "  Rolling back liqo-ipam (deployment)..."
+    echo ""
+    echo "Rolling back liqo-ipam..."
     CONTAINER_NAME=$(kubectl get deployment liqo-ipam -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    ROLLBACK_IMAGE="ghcr.io/liqotech/ipam:${PREVIOUS_VERSION}"
-    kubectl set image deployment/liqo-ipam \
-      "${CONTAINER_NAME}=${ROLLBACK_IMAGE}" \
-      -n "${NAMESPACE}"
+    kubectl set image deployment/liqo-ipam "${CONTAINER_NAME}=ghcr.io/liqotech/ipam:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    kubectl patch deployment liqo-ipam -n "${NAMESPACE}" --type=json \
+      -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
     kubectl rollout status deployment/liqo-ipam -n "${NAMESPACE}" --timeout=3m
-    echo "    ✓ liqo-ipam rolled back"
+    echo "  ✓ liqo-ipam rolled back"
   fi
 
+  # Rollback liqo-proxy
   if kubectl get deployment liqo-proxy -n "${NAMESPACE}" &>/dev/null; then
-    echo "  Rolling back liqo-proxy (deployment)..."
+    echo ""
+    echo "Rolling back liqo-proxy..."
     CONTAINER_NAME=$(kubectl get deployment liqo-proxy -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    ROLLBACK_IMAGE="ghcr.io/liqotech/proxy:${PREVIOUS_VERSION}"
-    kubectl set image deployment/liqo-proxy \
-      "${CONTAINER_NAME}=${ROLLBACK_IMAGE}" \
-      -n "${NAMESPACE}"
+    kubectl set image deployment/liqo-proxy "${CONTAINER_NAME}=ghcr.io/liqotech/proxy:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    kubectl patch deployment liqo-proxy -n "${NAMESPACE}" --type=json \
+      -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
     kubectl rollout status deployment/liqo-proxy -n "${NAMESPACE}" --timeout=3m
-    echo "    ✓ liqo-proxy rolled back"
+    echo "  ✓ liqo-proxy rolled back"
   fi
 
+  # Rollback liqo-fabric
   if kubectl get daemonset liqo-fabric -n "${NAMESPACE}" &>/dev/null; then
-    echo "  Rolling back liqo-fabric (daemonset)..."
+    echo ""
+    echo "Rolling back liqo-fabric..."
     CONTAINER_NAME=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    ROLLBACK_IMAGE="ghcr.io/liqotech/fabric:${PREVIOUS_VERSION}"
-    kubectl set image daemonset/liqo-fabric \
-      "${CONTAINER_NAME}=${ROLLBACK_IMAGE}" \
-      -n "${NAMESPACE}"
+    kubectl set image daemonset/liqo-fabric "${CONTAINER_NAME}=ghcr.io/liqotech/fabric:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    kubectl patch daemonset liqo-fabric -n "${NAMESPACE}" --type=json \
+      -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
     kubectl rollout status daemonset/liqo-fabric -n "${NAMESPACE}" --timeout=5m
-    echo "    ✓ liqo-fabric rolled back"
+    echo "  ✓ liqo-fabric rolled back"
   fi
 
-  echo "  ✅ Network fabric components rolled back"
+  echo ""
+  echo "✅ Network Fabric rollback complete"
 fi
 
-if [ "$LAST_PHASE" = "UpgradingControllerManager" ]; then
+#############################################
+# PHASE 2: ROLLBACK CORE CONTROL PLANE (if needed)
+#############################################
+if [ "$ROLLBACK_CORE" = "true" ]; then
   echo ""
-  echo "Note: Controller manager already rolled back in previous steps"
+  echo "========================================="
+  echo "PHASE 2: Rolling back Core Control Plane"
+  echo "========================================="
+
+  # Function to rollback a deployment
+  rollback_deployment() {
+    local COMPONENT=$1
+    local IMAGE_NAME=$2
+
+    if kubectl get deployment "${COMPONENT}" -n "${NAMESPACE}" &>/dev/null; then
+      echo ""
+      echo "Rolling back ${COMPONENT}..."
+      CONTAINER_NAME=$(kubectl get deployment "${COMPONENT}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
+      kubectl set image deployment/"${COMPONENT}" "${CONTAINER_NAME}=ghcr.io/liqotech/${IMAGE_NAME}:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+      
+      # Update labels
+      kubectl patch deployment "${COMPONENT}" -n "${NAMESPACE}" --type=json \
+        -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+             {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"},
+             {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+             {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+      
+      kubectl rollout status deployment/"${COMPONENT}" -n "${NAMESPACE}" --timeout=5m
+      echo "  ✓ ${COMPONENT} rolled back"
+    else
+      echo "  ⚠️ ${COMPONENT} not found, skipping"
+    fi
+  }
+
+  # Rollback core components
+  rollback_deployment "liqo-controller-manager" "liqo-controller-manager"
+  rollback_deployment "liqo-crd-replicator" "crd-replicator"
+  rollback_deployment "liqo-webhook" "webhook"
+
+  # Rollback liqo-metric-agent (including init container)
+  if kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" &>/dev/null; then
+    echo ""
+    echo "Rolling back liqo-metric-agent..."
+    CONTAINER_NAME=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
+    kubectl set image deployment/liqo-metric-agent "${CONTAINER_NAME}=ghcr.io/liqotech/metric-agent:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    
+    # Rollback init container (cert-creator)
+    INIT_EXISTS=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.initContainers[0].name}' 2>/dev/null || echo "")
+    if [ -n "$INIT_EXISTS" ]; then
+      echo "  Rolling back cert-creator init container..."
+      kubectl patch deployment liqo-metric-agent -n "${NAMESPACE}" --type=json \
+        -p='[{"op":"replace","path":"/spec/template/spec/initContainers/0/image","value":"ghcr.io/liqotech/cert-creator:'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "    Warning: Could not patch init container"
+    fi
+    
+    # Update labels
+    kubectl patch deployment liqo-metric-agent -n "${NAMESPACE}" --type=json \
+      -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+    
+    kubectl rollout status deployment/liqo-metric-agent -n "${NAMESPACE}" --timeout=3m
+    echo "  ✓ liqo-metric-agent rolled back"
+  fi
+
+  # Rollback liqo-telemetry CronJob
+  if kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" &>/dev/null; then
+    echo ""
+    echo "Rolling back liqo-telemetry CronJob..."
+    
+    # Update image
+    kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
+      -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/image","value":"ghcr.io/liqotech/telemetry:'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "  Warning: Could not patch image"
+    
+    # Update --liqo-version arg (find index first)
+    for i in 0 1 2 3 4 5; do
+      ARG_VAL=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
+        -o jsonpath="{.spec.jobTemplate.spec.template.spec.containers[0].args[${i}]}" 2>/dev/null || echo "")
+      if [[ "${ARG_VAL}" == --liqo-version=* ]]; then
+        kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
+          -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/args/'"${i}"'","value":"--liqo-version='"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+        break
+      fi
+    done
+    
+    # Update labels
+    kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
+      -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/jobTemplate/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/jobTemplate/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+    
+    echo "  ✓ liqo-telemetry rolled back"
+  fi
+
+  echo ""
+  echo "✅ Core Control Plane rollback complete"
 fi
 
-if [ "$LAST_PHASE" = "UpgradingCRDs" ] || [ "$LAST_PHASE" = "UpgradingControllerManager" ] || [ "$LAST_PHASE" = "UpgradingNetworkFabric" ]; then
+#############################################
+# PHASE 3: ROLLBACK CRDs (if needed)
+#############################################
+if [ "$ROLLBACK_CRDS" = "true" ]; then
   echo ""
-  echo "Note: CRD rollback may be needed but is not implemented in this simplified rollback"
-  echo "Manual intervention may be required if CRDs changed"
+  echo "========================================="
+  echo "PHASE 3: Rolling back CRDs"
+  echo "========================================="
+  echo ""
+
+  GITHUB_API_URL="https://api.github.com/repos/liqotech/liqo/contents/deployments/liqo/charts/liqo-crds/crds?ref=${PREVIOUS_VERSION}"
+  RAW_BASE_URL="https://raw.githubusercontent.com/liqotech/liqo/${PREVIOUS_VERSION}/deployments/liqo/charts/liqo-crds/crds"
+
+  echo "Fetching CRD list from GitHub for version ${PREVIOUS_VERSION}..."
+  echo "API URL: ${GITHUB_API_URL}"
+  echo ""
+
+  # Fetch list of CRD files from GitHub API
+  set +o pipefail
+  CRD_FILES=$(curl -fsSL "${GITHUB_API_URL}" 2>&1 | grep '"name":' | grep '.yaml"' | cut -d'"' -f4 || true)
+  set -o pipefail
+
+  if [ -z "$CRD_FILES" ]; then
+    echo "⚠️ WARNING: Failed to fetch CRD list from GitHub for rollback"
+    echo "  This could be due to network issues or invalid version tag"
+    echo "  CRD rollback will be skipped - manual intervention may be required"
+  else
+    CRD_COUNT=$(echo "$CRD_FILES" | wc -l)
+    echo "Found ${CRD_COUNT} CRD files to restore"
+    echo ""
+
+    SUCCESS_COUNT=0
+    FAILED_COUNT=0
+
+    for crd_file in $CRD_FILES; do
+      echo "Restoring ${crd_file}..."
+
+      set +e
+      YAML_CONTENT=$(curl -fsSL "${RAW_BASE_URL}/${crd_file}" 2>&1)
+      CURL_EXIT=$?
+      set -e
+
+      if [ $CURL_EXIT -ne 0 ]; then
+        echo "  ✗ Failed to fetch ${crd_file}"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        continue
+      fi
+
+      set +e
+      APPLY_OUTPUT=$(echo "$YAML_CONTENT" | kubectl apply --server-side --force-conflicts -f - 2>&1)
+      APPLY_EXIT=$?
+      set -e
+
+      if [ $APPLY_EXIT -eq 0 ]; then
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        echo "  ✓ ${crd_file} restored"
+      else
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        echo "  ✗ ${crd_file} failed: ${APPLY_OUTPUT}"
+      fi
+    done
+
+    echo ""
+    echo "CRD Rollback Summary: ${SUCCESS_COUNT} succeeded, ${FAILED_COUNT} failed"
+
+    if [ "$FAILED_COUNT" -gt 0 ]; then
+      echo "⚠️ WARNING: Some CRDs failed to rollback"
+    fi
+  fi
+
+  # Wait for CRDs to be established
+  echo ""
+  echo "Waiting for CRDs to stabilize..."
+  sleep 10
+
+  echo ""
+  echo "✅ CRD rollback complete"
+fi
+
+#############################################
+# FINAL VERIFICATION
+#############################################
+echo ""
+echo "========================================="
+echo "ROLLBACK VERIFICATION"
+echo "========================================="
+echo ""
+
+echo "Checking control-plane deployments..."
+ALL_HEALTHY=true
+
+for component in liqo-controller-manager liqo-crd-replicator liqo-metric-agent liqo-webhook; do
+  if kubectl get deployment "${component}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+    REPLICAS=$(kubectl get deployment "${component}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+    DESIRED=$(kubectl get deployment "${component}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+    IMAGE=$(kubectl get deployment "${component}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+
+    if [ "$REPLICAS" == "$DESIRED" ] && [ "$REPLICAS" != "0" ]; then
+      echo "  ✓ ${component}: ${REPLICAS}/${DESIRED} ready, image: ${IMAGE}"
+    else
+      echo "  ✗ ${component}: ${REPLICAS}/${DESIRED} ready (UNHEALTHY)"
+      ALL_HEALTHY=false
+    fi
+  fi
+done
+
+echo ""
+if [ "$ALL_HEALTHY" = "true" ]; then
+  echo "✅ CUMULATIVE ROLLBACK COMPLETED SUCCESSFULLY"
+  echo "   All components restored to version ${PREVIOUS_VERSION}"
+else
+  echo "⚠️ ROLLBACK COMPLETED WITH WARNINGS"
+  echo "   Some components may need manual attention"
 fi
 
 echo ""
-echo "✅ Rollback complete"
-echo "✅ Controller-manager restored to ${PREVIOUS_VERSION}"
-`, upgrade.Status.PreviousVersion, upgrade.Status.PreviousVersion, namespace, upgrade.Status.LastSuccessfulPhase)
+echo "Rollback scope executed:"
+echo "  - Network Fabric: ${ROLLBACK_NETWORK}"
+echo "  - Core Control Plane: ${ROLLBACK_CORE}"
+echo "  - CRDs: ${ROLLBACK_CRDS}"
+`, upgrade.Status.PreviousVersion, upgrade.Status.Phase, upgrade.Status.PreviousVersion,
+		upgrade.Status.PreviousVersion, namespace, failedPhase)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
