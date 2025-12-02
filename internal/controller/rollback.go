@@ -470,6 +470,167 @@ if [ "$ROLLBACK_CRDS" = "true" ]; then
 fi
 
 #############################################
+# PHASE 4: ROLLBACK RBAC CHANGES
+#############################################
+echo ""
+echo "========================================="
+echo "PHASE 4: Rolling back RBAC Changes"
+echo "========================================="
+
+# Revert liqo-telemetry ClusterRole RBAC fix (remove create/update verbs added during upgrade)
+if kubectl get clusterrole liqo-telemetry &>/dev/null; then
+  echo "Reverting liqo-telemetry ClusterRole permissions..."
+  
+  # Restore original verbs (get, list, watch) - remove create/update that were added
+  kubectl patch clusterrole liqo-telemetry --type='json' \
+    -p='[{"op":"replace","path":"/rules/0/verbs","value":["get","list","watch"]}]' \
+    && echo "  ✓ liqo-telemetry ClusterRole reverted to original permissions" \
+    || echo "  ⚠️ Warning: Could not revert liqo-telemetry ClusterRole"
+else
+  echo "  ℹ️ liqo-telemetry ClusterRole not found, skipping"
+fi
+
+echo ""
+echo "✅ RBAC rollback complete"
+
+#############################################
+# PHASE 5: ROLLBACK GATEWAY HA SCALING
+#############################################
+echo ""
+echo "========================================="
+echo "PHASE 5: Rolling back Gateway HA Scaling"
+echo "========================================="
+
+# If gateways were scaled to 2 replicas during upgrade, scale them back to 1
+TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
+GATEWAYS_SCALED_BACK=0
+
+for TENANT_NS in $TENANT_NAMESPACES; do
+  GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  
+  for GW_DEPLOY in $GATEWAY_DEPLOYMENTS; do
+    if [ -n "$GW_DEPLOY" ]; then
+      CURRENT_REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+      
+      if [ "$CURRENT_REPLICAS" -gt 1 ]; then
+        echo "  Scaling ${GW_DEPLOY} in ${TENANT_NS} from ${CURRENT_REPLICAS} to 1 replica..."
+        kubectl scale deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --replicas=1 2>/dev/null && {
+          echo "    ✓ Scaled back to 1 replica"
+          GATEWAYS_SCALED_BACK=$((GATEWAYS_SCALED_BACK + 1))
+        } || echo "    ⚠️ Could not scale ${GW_DEPLOY}"
+      fi
+    fi
+  done
+done
+
+if [ "$GATEWAYS_SCALED_BACK" -gt 0 ]; then
+  echo "✅ Scaled back ${GATEWAYS_SCALED_BACK} gateway(s) to 1 replica"
+else
+  echo "ℹ️ No gateways needed scaling back"
+fi
+
+#############################################
+# PHASE 6: ROLLBACK VKOPTIONSTEMPLATE
+#############################################
+echo ""
+echo "========================================="
+echo "PHASE 6: Rolling back VkOptionsTemplate"
+echo "========================================="
+
+if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/dev/null; then
+  echo "Reverting VkOptionsTemplate to version ${PREVIOUS_VERSION}..."
+  
+  kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/containerImage", "value": "ghcr.io/liqotech/virtual-kubelet:'"${PREVIOUS_VERSION}"'"}
+    ]' && echo "  ✓ VkOptionsTemplate reverted" || echo "  ⚠️ Warning: Could not revert VkOptionsTemplate"
+else
+  echo "  ℹ️ VkOptionsTemplate not found, skipping"
+fi
+
+#############################################
+# PHASE 7: ROLLBACK VIRTUALNODE RESOURCES
+#############################################
+echo ""
+echo "========================================="
+echo "PHASE 7: Rolling back VirtualNode Resources"
+echo "========================================="
+
+VIRTUALNODES=$(kubectl get virtualnodes -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+if [ -n "$VIRTUALNODES" ]; then
+  VN_COUNT=0
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      VN_NAMESPACE=$(echo "$line" | awk '{print $1}')
+      VN_NAME=$(echo "$line" | awk '{print $2}')
+
+      echo "  Reverting VirtualNode: ${VN_NAME} in namespace ${VN_NAMESPACE}..."
+      
+      kubectl patch virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
+        --type='json' -p='[
+          {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${PREVIOUS_VERSION}"'"}
+        ]' 2>/dev/null && {
+          echo "    ✓ VirtualNode image reverted"
+          VN_COUNT=$((VN_COUNT + 1))
+        } || echo "    ⚠️ Warning: Could not revert VirtualNode"
+    fi
+  done <<< "$VIRTUALNODES"
+  
+  echo "✅ Reverted ${VN_COUNT} VirtualNode(s)"
+  
+  # Delete VK deployments to force recreation with old image
+  if [ "$VN_COUNT" -gt 0 ]; then
+    echo "Deleting VK deployments to force recreation..."
+    kubectl delete deployments -A -l offloading.liqo.io/component=virtual-kubelet --wait=false 2>/dev/null || true
+    echo "  ✓ VK deployments deleted (will be recreated by controller)"
+  fi
+else
+  echo "  ℹ️ No VirtualNode resources found, skipping"
+fi
+
+#############################################
+# PHASE 8: CLEANUP UPGRADE ANNOTATIONS
+#############################################
+echo ""
+echo "========================================="
+echo "PHASE 8: Cleaning up Upgrade Annotations"
+echo "========================================="
+
+# Remove upgrade trigger annotations from nodes
+echo "Removing upgrade annotations from nodes..."
+for NODE in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  kubectl annotate node "$NODE" liqo.io/upgrade-trigger- 2>/dev/null || true
+  kubectl label node "$NODE" liqo.io/upgrade-trigger- 2>/dev/null || true
+done
+echo "  ✓ Node annotations cleaned"
+
+# Remove upgrade annotations from InternalNodes
+echo "Removing upgrade annotations from InternalNodes..."
+INTERNAL_NODES=$(kubectl get internalnodes -A -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+for INODE in $INTERNAL_NODES; do
+  kubectl annotate internalnode "${INODE}" liqo.io/upgrade-trigger- 2>/dev/null || true
+done
+echo "  ✓ InternalNode annotations cleaned"
+
+# Remove upgrade annotations from RouteConfigurations
+echo "Removing upgrade annotations from RouteConfigurations..."
+ROUTE_CONFIGS=$(kubectl get routeconfigurations -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+if [ -n "$ROUTE_CONFIGS" ]; then
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      RC_NS=$(echo "$line" | awk '{print $1}')
+      RC_NAME=$(echo "$line" | awk '{print $2}')
+      kubectl annotate routeconfiguration "${RC_NAME}" -n "${RC_NS}" liqo.io/upgrade-trigger- 2>/dev/null || true
+    fi
+  done <<< "$ROUTE_CONFIGS"
+fi
+echo "  ✓ RouteConfiguration annotations cleaned"
+
+echo ""
+echo "✅ Cleanup complete"
+
+#############################################
 # FINAL VERIFICATION
 #############################################
 echo ""
@@ -497,6 +658,20 @@ for component in liqo-controller-manager liqo-crd-replicator liqo-metric-agent l
 done
 
 echo ""
+echo "Checking network fabric components..."
+for component in liqo-ipam liqo-proxy; do
+  if kubectl get deployment "${component}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+    IMAGE=$(kubectl get deployment "${component}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    echo "  ✓ ${component}: ${IMAGE}"
+  fi
+done
+
+if kubectl get daemonset liqo-fabric -n "${NAMESPACE}" > /dev/null 2>&1; then
+  IMAGE=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+  echo "  ✓ liqo-fabric: ${IMAGE}"
+fi
+
+echo ""
 if [ "$ALL_HEALTHY" = "true" ]; then
   echo "✅ CUMULATIVE ROLLBACK COMPLETED SUCCESSFULLY"
   echo "   All components restored to version ${PREVIOUS_VERSION}"
@@ -510,6 +685,11 @@ echo "Rollback scope executed:"
 echo "  - Network Fabric: ${ROLLBACK_NETWORK}"
 echo "  - Core Control Plane: ${ROLLBACK_CORE}"
 echo "  - CRDs: ${ROLLBACK_CRDS}"
+echo "  - RBAC: true"
+echo "  - Gateway HA: true"
+echo "  - VkOptionsTemplate: true"
+echo "  - VirtualNodes: true"
+echo "  - Cleanup annotations: true"
 `, upgrade.Status.PreviousVersion, upgrade.Status.Phase, upgrade.Status.PreviousVersion,
 		upgrade.Status.PreviousVersion, namespace, failedPhase)
 
