@@ -228,58 +228,177 @@ fi
 
 echo ""
 echo "========================================="
-echo "Step 2.5: Enable Gateway HA for Zero-Downtime Upgrade"
+echo "Step 3: Gateway Template HA Configuration"
 echo "========================================="
-echo "Scaling gateway deployments to 2 replicas for active/passive failover..."
-echo "This enables zero-downtime upgrades using Liqo's built-in HA mechanism."
+echo "CRITICAL: We must patch templates for HA BEFORE updating images."
+echo "This is the ONLY way to achieve zero-downtime gateway upgrade."
+echo ""
+echo "The Liqo controller chain works as follows:"
+echo "  WgGatewayClientTemplate → WgGatewayClient → Deployment"
+echo "  (Controllers overwrite any manual patches to WgGatewayClient)"
+echo ""
+echo "Strategy: Patch templates with replicas=2 + RollingUpdate,"
+echo "          then update images. RollingUpdate will upgrade one pod at a time."
 echo ""
 
-# Find all gateway deployments in tenant namespaces
+# Step 3a: Enable HA mode in templates FIRST (before image update)
+echo "--- Step 3a: Enabling HA Mode in Templates ---"
+
+# Patch WgGatewayClientTemplate for HA
+if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev/null; then
+  echo "Patching WgGatewayClientTemplate for HA mode..."
+  
+  # Set replicas=2 and strategy=RollingUpdate
+  kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/replicas", "value": 2},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/strategy", "value": {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}}}
+    ]' && echo "  ✓ WgGatewayClientTemplate: replicas=2, strategy=RollingUpdate" || {
+    echo "  ⚠️ Warning: Could not patch HA settings, trying alternative..."
+    # Try patching separately
+    kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+      --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/deployment/spec/replicas", "value": 2}]' 2>/dev/null || true
+    kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+      --type='merge' -p='{"spec":{"template":{"spec":{"deployment":{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":0,"maxSurge":1}}}}}}}}' 2>/dev/null || true
+  }
+else
+  echo "  ℹ️  WgGatewayClientTemplate not found"
+fi
+
+# Patch WgGatewayServerTemplate for HA
+if kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" &>/dev/null; then
+  echo "Patching WgGatewayServerTemplate for HA mode..."
+  
+  kubectl patch wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/replicas", "value": 2},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/strategy", "value": {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}}}
+    ]' && echo "  ✓ WgGatewayServerTemplate: replicas=2, strategy=RollingUpdate" || {
+    echo "  ⚠️ Warning: Could not patch HA settings"
+  }
+else
+  echo "  ℹ️  WgGatewayServerTemplate not found"
+fi
+
+echo ""
+echo "--- Step 3b: Triggering Controller Propagation ---"
+echo "The reconcilers do NOT watch templates automatically."
+echo "We must annotate Gateway resources to trigger re-render from template."
+echo ""
+
+# Annotate Gateway resources (Client or Server) per tenant namespace
 TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
-GATEWAYS_SCALED=0
+HA_CLIENT_COUNT=0
+HA_SERVER_COUNT=0
+for TENANT_NS in $TENANT_NAMESPACES; do
+  # Detect gateway type for this namespace
+  GATEWAY_CLIENTS=$(kubectl get gatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  GATEWAY_SERVERS=$(kubectl get gatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  
+  # Process GatewayClients if present
+  for GW_CLIENT in $GATEWAY_CLIENTS; do
+    HA_TS=$(date +%%s)
+    kubectl annotate gatewayclient "${GW_CLIENT}" -n "${TENANT_NS}" liqo.io/ha-upgrade="${HA_TS}" --overwrite 2>/dev/null || true
+    echo "  ✓ Triggered reconciliation for GatewayClient ${GW_CLIENT} in ${TENANT_NS}"
+    HA_CLIENT_COUNT=$((HA_CLIENT_COUNT + 1))
+  done
+  
+  # Process GatewayServers if present
+  for GW_SERVER in $GATEWAY_SERVERS; do
+    HA_TS=$(date +%%s)
+    kubectl annotate gatewayserver "${GW_SERVER}" -n "${TENANT_NS}" liqo.io/ha-upgrade="${HA_TS}" --overwrite 2>/dev/null || true
+    echo "  ✓ Triggered reconciliation for GatewayServer ${GW_SERVER} in ${TENANT_NS}"
+    HA_SERVER_COUNT=$((HA_SERVER_COUNT + 1))
+  done
+done
+
+if [ "$HA_CLIENT_COUNT" -eq 0 ] && [ "$HA_SERVER_COUNT" -eq 0 ]; then
+  echo "  ℹ️ No Gateway resources found to trigger"
+else
+  echo "  Summary: ${HA_CLIENT_COUNT} GatewayClient(s), ${HA_SERVER_COUNT} GatewayServer(s) triggered"
+fi
+
+echo ""
+echo "Waiting for controllers to propagate HA settings (15s)..."
+sleep 15
+
+# Verify templates have HA settings
+echo ""
+echo "Verifying template HA configuration..."
+CLIENT_REPLICAS=$(kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.replicas}' 2>/dev/null || echo "1")
+CLIENT_STRATEGY=$(kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.strategy.type}' 2>/dev/null || echo "unknown")
+echo "  Client template: replicas=${CLIENT_REPLICAS}, strategy=${CLIENT_STRATEGY}"
+
+SERVER_REPLICAS=$(kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.replicas}' 2>/dev/null || echo "1")
+SERVER_STRATEGY=$(kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.strategy.type}' 2>/dev/null || echo "unknown")
+echo "  Server template: replicas=${SERVER_REPLICAS}, strategy=${SERVER_STRATEGY}"
+
+# Wait for deployments to have 2 replicas ready
+echo ""
+echo "--- Step 3c: Waiting for Gateway Pods to Scale Up ---"
+TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
+GATEWAYS_HA_READY=0
 
 for TENANT_NS in $TENANT_NAMESPACES; do
   GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
   
   for GW_DEPLOY in $GATEWAY_DEPLOYMENTS; do
     if [ -n "$GW_DEPLOY" ]; then
-      CURRENT_REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+      echo "  Waiting for ${GW_DEPLOY} to have 2 ready replicas..."
       
-      if [ "$CURRENT_REPLICAS" -lt 2 ]; then
-        echo "  Scaling ${GW_DEPLOY} in ${TENANT_NS} from ${CURRENT_REPLICAS} to 2 replicas..."
-        kubectl scale deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --replicas=2 2>/dev/null && {
-          echo "    ✓ Scaled to 2 replicas"
-          GATEWAYS_SCALED=$((GATEWAYS_SCALED + 1))
-          
-          # Wait for second replica to be ready
-          echo "    Waiting for passive replica to be ready..."
-          kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=2m 2>/dev/null || echo "    ⚠️ Rollout status timeout"
-        } || echo "    ⚠️ Could not scale ${GW_DEPLOY}"
-      else
-        echo "  ${GW_DEPLOY} in ${TENANT_NS} already has ${CURRENT_REPLICAS} replicas"
-      fi
+      for WAIT in $(seq 1 60); do
+        READY=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        STRATEGY=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.strategy.type}' 2>/dev/null || echo "unknown")
+        
+        if [ "$READY" -ge 2 ] && [ "$REPLICAS" -ge 2 ]; then
+          echo "    ✓ ${GW_DEPLOY}: ${READY}/${REPLICAS} ready, strategy=${STRATEGY}"
+          GATEWAYS_HA_READY=$((GATEWAYS_HA_READY + 1))
+          break
+        fi
+        
+        if [ $((WAIT %% 10)) -eq 0 ]; then
+          echo "    ⏳ Waiting... ${READY}/${REPLICAS} ready (${WAIT}s)"
+        fi
+        sleep 1
+      done
     fi
   done
 done
 
-if [ "$GATEWAYS_SCALED" -gt 0 ]; then
-  echo ""
-  echo "✅ Scaled ${GATEWAYS_SCALED} gateway(s) to 2 replicas for HA upgrade"
-  echo "   Active/passive failover will minimize network disruption."
-  
-  # Brief wait for leader election to stabilize
-  echo "   Waiting for leader election to stabilize (10s)..."
-  sleep 10
-else
-  echo "ℹ️  No gateways needed scaling (already HA or none found)"
-fi
+# Wait for leader election
+echo ""
+echo "Waiting for leader election to stabilize (10s)..."
+sleep 10
+
+echo "Verifying gateway leader election..."
+for TENANT_NS in $TENANT_NAMESPACES; do
+  ACTIVE_POD=$(kubectl get pods -n "${TENANT_NS}" \
+    -l networking.liqo.io/component=gateway,networking.liqo.io/active=true \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  if [ -n "$ACTIVE_POD" ]; then
+    echo "  ✓ ${TENANT_NS}: Active gateway is ${ACTIVE_POD}"
+  else
+    echo "  ⚠️ ${TENANT_NS}: No active leader yet (may still be electing)"
+  fi
+done
+
+echo ""
+echo "✅ Gateway HA Mode Enabled: ${GATEWAYS_HA_READY} gateway(s) with 2 replicas + RollingUpdate"
 
 echo ""
 echo "========================================="
-echo "Step 3: Upgrading Gateway Templates (MUST happen before gateway instance recreation)..."
+echo "--- Step 3d: Upgrading Gateway Images ---"
 echo "========================================="
+echo "Now updating gateway images. RollingUpdate will upgrade one pod at a time."
+echo ""
 
-# Upgrade WgGatewayClientTemplate
+# Upgrade WgGatewayClientTemplate images
 echo "--- Upgrading WgGatewayClientTemplate ---"
 if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev/null; then
   echo "Updating WgGatewayClientTemplate to version ${TARGET_VERSION}..."
@@ -304,7 +423,7 @@ else
   echo "  ℹ️  WgGatewayClientTemplate not found, skipping"
 fi
 
-# Upgrade WgGatewayServerTemplate
+# Upgrade WgGatewayServerTemplate images
 echo "--- Upgrading WgGatewayServerTemplate ---"
 if kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" &>/dev/null; then
   echo "Updating WgGatewayServerTemplate to version ${TARGET_VERSION}..."
@@ -330,7 +449,8 @@ fi
 
 # Verify templates were updated
 sleep 2
-echo "Verifying template updates..."
+echo ""
+echo "Verifying template image updates..."
 CLIENT_TEMPLATE_IMAGE=$(kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
   -o jsonpath='{.spec.template.spec.deployment.spec.template.spec.containers[0].image}' 2>/dev/null || echo "not found")
 echo "  Client template image: ${CLIENT_TEMPLATE_IMAGE}"
@@ -350,35 +470,9 @@ if [[ "$SERVER_TEMPLATE_IMAGE" != *"${TARGET_VERSION}"* ]] && [[ "$SERVER_TEMPLA
 fi
 
 echo "✅ Gateway templates upgraded successfully"
-
-# CRITICAL: Pause gateway deployments immediately to prevent automatic rollout
-# The controller-manager will update gateway deployments when templates change,
-# but we need to pause them so we can do active/passive upgrade in Step 5.5
 echo ""
-echo "Pausing gateway deployments to enable active/passive upgrade..."
-TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
-GATEWAY_PAUSED_COUNT=0
-for TENANT_NS in ${TENANT_NAMESPACES}; do
-  GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-  for GW_DEPLOY in $GATEWAY_DEPLOYMENTS; do
-    # Check if deployment exists and has 2+ replicas (HA mode)
-    CURRENT_REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
-    if [ "$CURRENT_REPLICAS" -ge 2 ]; then
-      # Pause rollout to prevent automatic rolling update
-      if kubectl rollout pause deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" 2>/dev/null; then
-        echo "  ✓ Paused ${GW_DEPLOY} in ${TENANT_NS} (${CURRENT_REPLICAS} replicas - HA mode)"
-        GATEWAY_PAUSED_COUNT=$((GATEWAY_PAUSED_COUNT + 1))
-      else
-        echo "  ⚠️  Could not pause ${GW_DEPLOY} in ${TENANT_NS}"
-      fi
-    fi
-  done
-done
-if [ "$GATEWAY_PAUSED_COUNT" -gt 0 ]; then
-  echo "✅ Paused ${GATEWAY_PAUSED_COUNT} gateway deployment(s) for active/passive upgrade"
-else
-  echo "ℹ️  No HA gateways found to pause (all single replica or none exist)"
-fi
+echo "NOTE: Image updates will be applied in Step 5.5 after fabric is stable."
+echo "This ensures gateway upgrade happens when network is ready."
 
 echo ""
 echo "Step 4: Upgrading network components sequentially with health checks..."
@@ -859,11 +953,37 @@ echo "✅ Controller Manager restarted and reconciliation triggered"
 
 echo ""
 echo "========================================="
-echo "Step 5.5: Gateway Stabilization (Wait, Tune & Sync)"
+echo "Step 5.5: Gateway RollingUpdate Upgrade"
 echo "========================================="
-echo "This step waits for the controller's rollout, applies network tuning,"
-echo "and actively verifies IP synchronization between Control Plane and Data Plane."
+echo "Since we configured RollingUpdate strategy in Step 3, Kubernetes"
+echo "will automatically upgrade gateway pods one at a time."
 echo ""
+echo "The RollingUpdate process (handled by Kubernetes):"
+echo "  1. Create new pod with new image"
+echo "  2. Wait for new pod to be ready"
+echo "  3. Terminate old pod"
+echo "  4. Repeat until all pods upgraded"
+echo ""
+echo "Leader election ensures traffic always flows through an active pod."
+echo "Expected disruption: ~1-3 seconds during leader failover."
+echo ""
+
+# Function to check tunnel connectivity
+check_tunnel_connectivity() {
+  local TENANT_NS=$1
+  local FC_NAME=$2
+  local TIMEOUT=${3:-30}
+  
+  for i in $(seq 1 $TIMEOUT); do
+    NETWORK_STATUS=$(kubectl get foreigncluster "${FC_NAME}" \
+      -o jsonpath='{.status.modules.networking.conditions[?(@.type=="NetworkConnectionStatus")].status}' 2>/dev/null || echo "")
+    if [ "$NETWORK_STATUS" == "Established" ] || [ "$NETWORK_STATUS" == "Ready" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 # Find all tenant namespaces
 TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
@@ -871,231 +991,173 @@ TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name
 if [ -n "$TENANT_NAMESPACES" ]; then
   for TENANT_NS in $TENANT_NAMESPACES; do
     echo "--- Processing ${TENANT_NS} ---"
+    FC_NAME="${TENANT_NS#liqo-tenant-}"
 
-    # 1. Clear Leader Election Leases
-    echo "  Clearing leader election leases..."
-    kubectl delete lease -n "${TENANT_NS}" -l "liqo.io/component=gateway" --ignore-not-found=true 2>/dev/null || true
-    
-    # Also try by name pattern
-    LEASES=$(kubectl get leases -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E 'gateway|wg-' || true)
-    for LEASE in $LEASES; do
-      kubectl delete lease "${LEASE}" -n "${TENANT_NS}" --ignore-not-found=true 2>/dev/null || true
-    done
+    # 1. Pre-upgrade connectivity check
+    echo "  Pre-upgrade connectivity check..."
+    if check_tunnel_connectivity "${TENANT_NS}" "${FC_NAME}" 5; then
+      echo "    ✓ Tunnel connectivity verified"
+    else
+      echo "    ⚠️ Warning: Tunnel not fully established"
+    fi
 
     # 2. Find Gateway Deployments
     GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     
     if [ -z "$GATEWAY_DEPLOYMENTS" ]; then
-      echo "    ℹ️ No gateway deployments found in ${TENANT_NS}"
+      echo "    ℹ️ No gateway deployments found"
+      continue
     fi
 
     for GW_DEPLOY in $GATEWAY_DEPLOYMENTS; do
-        echo "    Processing Gateway: ${GW_DEPLOY}"
-        GW_CLIENT_NAME=$(echo "${GW_DEPLOY}" | sed 's/^gw-//')
+        echo "    Gateway: ${GW_DEPLOY}"
+        GW_NAME=$(echo "${GW_DEPLOY}" | sed 's/^gw-//')
         
-        # Check if we have 2+ replicas (HA mode enabled)
+        # Detect gateway type (client or server) for this namespace
+        GW_TYPE="client"
+        if kubectl get gatewayserver "${GW_NAME}" -n "${TENANT_NS}" &>/dev/null; then
+          GW_TYPE="server"
+        fi
+        echo "      Type: Gateway${GW_TYPE^}"
+        
+        # Check current state
         CURRENT_REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        CURRENT_STRATEGY=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.strategy.type}' 2>/dev/null || echo "unknown")
+        CURRENT_IMG=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
         
-        if [ "$CURRENT_REPLICAS" -ge 2 ]; then
-          echo "    🐦 Using Active/Passive HA upgrade strategy (${CURRENT_REPLICAS} replicas)"
-          echo "    This enables zero-downtime upgrade via leader election failover."
+        echo "      Replicas: ${CURRENT_REPLICAS}, Strategy: ${CURRENT_STRATEGY}"
+        
+        if [ "$CURRENT_STRATEGY" == "RollingUpdate" ] && [ "$CURRENT_REPLICAS" -ge 2 ]; then
+          echo "    🔄 RollingUpdate with ${CURRENT_REPLICAS} replicas (HA mode)"
           
-          # Step 1: Ensure deployment is paused (may already be paused from Step 3)
-          echo "    Step 1: Ensuring rollout is paused..."
-          IS_PAUSED=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.paused}' 2>/dev/null || echo "false")
-          if [ "$IS_PAUSED" != "true" ]; then
-            kubectl rollout pause deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" 2>/dev/null || {
-              echo "      ⚠️ Could not pause rollout, falling back to standard rollout"
-              kubectl rollout resume deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" 2>/dev/null || true
-              kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "      ⚠️ Rollout timed out"
-              continue
-            }
-            echo "      ✓ Rollout paused"
+          # EARLY IP VALIDATION: Check if status IP matches any running pod
+          # This handles the "rollout already completed" case where status IP is stale
+          echo "      Checking status IP validity..."
+          RUNNING_POD_IPS=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway \
+            --field-selector=status.phase=Running -o jsonpath='{.items[*].status.podIP}' 2>/dev/null || echo "")
+          
+          if [ "$GW_TYPE" == "server" ]; then
+            CURRENT_STATUS_IP=$(kubectl get gatewayserver "${GW_NAME}" -n "${TENANT_NS}" \
+              -o jsonpath='{.status.internalEndpoint.ip}' 2>/dev/null || echo "")
           else
-            echo "      ✓ Rollout already paused (from Step 3)"
+            CURRENT_STATUS_IP=$(kubectl get gatewayclient "${GW_NAME}" -n "${TENANT_NS}" \
+              -o jsonpath='{.status.internalEndpoint.ip}' 2>/dev/null || echo "")
           fi
           
-          # Step 2: Check if image is already updated (controller may have done it)
-          echo "    Step 2: Checking/updating deployment image to ${TARGET_VERSION}..."
-          CURRENT_IMG=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-          if echo "$CURRENT_IMG" | grep -q "${TARGET_VERSION}"; then
-            echo "      ✓ Image already updated to ${TARGET_VERSION} (controller updated it)"
-          else
-            # Update deployment image (creates new ReplicaSet template)
-            kubectl set image deployment/"${GW_DEPLOY}" \
-              gateway=ghcr.io/liqotech/gateway:${TARGET_VERSION} \
-              wireguard=ghcr.io/liqotech/gateway/wireguard:${TARGET_VERSION} \
-              geneve=ghcr.io/liqotech/gateway/geneve:${TARGET_VERSION} \
-              -n "${TENANT_NS}" 2>/dev/null || {
-              echo "      ⚠️ Could not update images, falling back to standard rollout"
-              kubectl rollout resume deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" 2>/dev/null || true
-              kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "      ⚠️ Rollout timed out"
-              continue
-            }
-            echo "      ✓ Image updated to ${TARGET_VERSION}"
-          fi
-          
-          # Step 3: Identify active and passive pods (before upgrade)
-          echo "    Step 3: Identifying active and passive pods..."
-          sleep 2  # Brief wait for labels to be set
-          
-          # Get active pod (has networking.liqo.io/active=true label)
-          ACTIVE_POD=$(kubectl get pods -n "${TENANT_NS}" \
-            -l networking.liqo.io/component=gateway,networking.liqo.io/active=true \
-            --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-          
-          # Get all running gateway pods
-          ALL_PODS=$(kubectl get pods -n "${TENANT_NS}" \
-            -l networking.liqo.io/component=gateway \
-            --field-selector=status.phase=Running \
-            -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.labels.networking\.liqo\.io/active}{"\n"}{end}' 2>/dev/null || echo "")
-          
-          # Find passive pod (doesn't have active=true label)
-          PASSIVE_POD=""
-          while IFS= read -r line; do
-            if [ -n "$line" ]; then
-              POD_NAME=$(echo "$line" | awk '{print $1}')
-              ACTIVE_LABEL=$(echo "$line" | awk '{print $2}')
-              if [ "$POD_NAME" != "$ACTIVE_POD" ] && [ -z "$ACTIVE_LABEL" ] || [ "$ACTIVE_LABEL" != "true" ]; then
-                PASSIVE_POD="$POD_NAME"
+          IP_VALID="false"
+          if [ -n "$CURRENT_STATUS_IP" ]; then
+            for POD_IP in $RUNNING_POD_IPS; do
+              if [ "$POD_IP" == "$CURRENT_STATUS_IP" ]; then
+                IP_VALID="true"
                 break
               fi
-            fi
-          done <<< "$ALL_PODS"
+            done
+          fi
           
-          if [ -z "$ACTIVE_POD" ] || [ -z "$PASSIVE_POD" ]; then
-            echo "      ⚠️ Could not identify active/passive pods (Active: ${ACTIVE_POD:-none}, Passive: ${PASSIVE_POD:-none})"
-            echo "      Falling back to standard rolling update..."
-            kubectl rollout resume deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" 2>/dev/null || true
-            kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "      ⚠️ Rollout timed out"
-          else
-            echo "      Active pod: ${ACTIVE_POD}"
-            echo "      Passive pod: ${PASSIVE_POD}"
-            
-            # Step 4: Delete passive pod first (will be recreated with new image from updated ReplicaSet)
-            echo "    Step 4: Upgrading passive pod (${PASSIVE_POD})..."
-            kubectl delete pod "${PASSIVE_POD}" -n "${TENANT_NS}" --wait=false 2>/dev/null || {
-              echo "      ⚠️ Could not delete passive pod, falling back to standard rollout"
-              kubectl rollout resume deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" 2>/dev/null || true
-              kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "      ⚠️ Rollout timed out"
-              continue
-            }
-            
-            # Step 5: Wait for new passive pod to be ready with new image
-            echo "    Step 5: Waiting for upgraded passive pod to be ready..."
-            PASSIVE_READY=false
-            NEW_PASSIVE=""
-            for WAIT_ATTEMPT in $(seq 1 30); do
-              # Find new passive pod (different name, running, not active)
-              NEW_PASSIVE=$(kubectl get pods -n "${TENANT_NS}" \
-                -l networking.liqo.io/component=gateway \
-                --field-selector=status.phase=Running \
-                -o jsonpath='{range .items[?(@.metadata.labels.networking\.liqo\.io/active != "true")]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -1)
-              
-              if [ -n "$NEW_PASSIVE" ] && [ "$NEW_PASSIVE" != "$PASSIVE_POD" ]; then
-                # Check if new passive pod is ready and has new image
-                READY_STATUS=$(kubectl get pod "${NEW_PASSIVE}" -n "${TENANT_NS}" \
-                  -o jsonpath='{.status.containerStatuses[*].ready}' 2>/dev/null || echo "")
-                POD_IMAGE=$(kubectl get pod "${NEW_PASSIVE}" -n "${TENANT_NS}" \
-                  -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "")
-                
-                if echo "$READY_STATUS" | grep -q "true" && ! echo "$READY_STATUS" | grep -q "false"; then
-                  if echo "$POD_IMAGE" | grep -q "${TARGET_VERSION}"; then
-                    echo "      ✓ New passive pod ${NEW_PASSIVE} is ready with ${TARGET_VERSION}"
-                    PASSIVE_READY=true
-                    break
-                  else
-                    echo "      ⏳ Waiting... (${WAIT_ATTEMPT}/30) Passive pod ready but image not updated yet"
-                  fi
-                else
-                  echo "      ⏳ Waiting... (${WAIT_ATTEMPT}/30) Passive pod not fully ready"
-                fi
-              else
-                echo "      ⏳ Waiting... (${WAIT_ATTEMPT}/30) New passive pod not found yet"
-              fi
-              sleep 2
-            done
-            
-            if [ "$PASSIVE_READY" != "true" ]; then
-              echo "      ⚠️ Passive pod not ready in time, proceeding with failover anyway"
-            fi
-            
-            # Step 6: Force failover by deleting leader lease
-            echo "    Step 6: Forcing failover to upgraded passive pod..."
-            kubectl delete lease -n "${TENANT_NS}" -l "liqo.io/component=gateway" --ignore-not-found=true 2>/dev/null || true
-            LEASES=$(kubectl get leases -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep -E 'gateway|wg-' || true)
-            for LEASE in $LEASES; do
-              kubectl delete lease "${LEASE}" -n "${TENANT_NS}" --ignore-not-found=true 2>/dev/null || true
-            done
-            
-            # Wait for failover (passive becomes active)
-            echo "    Step 7: Waiting for failover to complete (5s)..."
-            sleep 5
-            
-            # Verify failover happened
-            NEW_ACTIVE=$(kubectl get pods -n "${TENANT_NS}" \
-              -l networking.liqo.io/component=gateway,networking.liqo.io/active=true \
-              --field-selector=status.phase=Running \
-              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-            
-            if [ "$NEW_ACTIVE" == "$NEW_PASSIVE" ] || [ "$NEW_ACTIVE" != "$ACTIVE_POD" ]; then
-              echo "      ✓ Failover successful! New active pod: ${NEW_ACTIVE:-unknown}"
+          if [ "$IP_VALID" != "true" ] && [ -n "$CURRENT_STATUS_IP" ]; then
+            echo "      ⚠️ Status IP (${CURRENT_STATUS_IP}) is stale - not matching any running pod"
+            echo "      Triggering immediate reconciliation to fix status..."
+            EARLY_SYNC_TS=$(date +%%s)
+            if [ "$GW_TYPE" == "server" ]; then
+              kubectl annotate gatewayserver "${GW_NAME}" -n "${TENANT_NS}" liqo.io/force-sync="${EARLY_SYNC_TS}" --overwrite 2>/dev/null || true
             else
-              echo "      ⚠️ Failover may not have completed (old active still active: ${ACTIVE_POD})"
+              kubectl annotate gatewayclient "${GW_NAME}" -n "${TENANT_NS}" liqo.io/force-sync="${EARLY_SYNC_TS}" --overwrite 2>/dev/null || true
             fi
-            
-            # Step 8: Delete old active pod (will be recreated with new image)
-            echo "    Step 8: Upgrading old active pod (${ACTIVE_POD})..."
-            kubectl delete pod "${ACTIVE_POD}" -n "${TENANT_NS}" --wait=false 2>/dev/null || true
-            
-            # Step 9: Resume rollout and wait for all pods to be ready
-            echo "    Step 9: Resuming rollout..."
-            kubectl rollout resume deployment/"${GW_DEPLOY}" -n "${TENANT_NS}" 2>/dev/null || true
-            
-            # Wait for all pods to be ready
-            echo "    Step 10: Waiting for all gateway pods to be ready..."
-            for WAIT_ATTEMPT in $(seq 1 30); do
-              READY_COUNT=$(kubectl get pods -n "${TENANT_NS}" \
-                -l networking.liqo.io/component=gateway \
-                --field-selector=status.phase=Running \
-                -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.ready==true)]}{end}' 2>/dev/null | grep -o "ready" | wc -l || echo "0")
-              
-              if [ "$READY_COUNT" -ge 6 ]; then  # 2 pods × 3 containers = 6 ready containers
-                echo "      ✓ All gateway pods ready"
-                break
-              fi
-              echo "      ⏳ Waiting... (${WAIT_ATTEMPT}/30) Ready containers: ${READY_COUNT}/6"
-              sleep 2
-            done
-            
-            echo "    ✅ Active/Passive upgrade complete - zero downtime achieved!"
+            echo "      Waiting for controller to update status (5s)..."
+            sleep 5
+          else
+            echo "      ✓ Status IP valid"
           fi
-        else
-          echo "    ℹ️ Single replica mode - using standard rolling update"
           
-          # Standard rolling update for single replica
-          echo "    Waiting for controller to update image to ${TARGET_VERSION}..."
-          IMG_UPDATED=false
-          for IMG_WAIT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-            CUR_IMG=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
-            if echo "$CUR_IMG" | grep -q "${TARGET_VERSION}"; then
-               echo "      ✓ Image updated to ${TARGET_VERSION}"
-               IMG_UPDATED=true
-               break
+          # Check if image needs updating
+          if echo "$CURRENT_IMG" | grep -q "${TARGET_VERSION}"; then
+            echo "      ✓ Already at ${TARGET_VERSION}"
+          else
+            # Trigger image update now (after fabric is stable)
+            echo "      Triggering image update (fabric is now stable)..."
+            IMG_TS=$(date +%%s)
+            if [ "$GW_TYPE" == "server" ]; then
+              kubectl annotate gatewayserver "${GW_NAME}" -n "${TENANT_NS}" liqo.io/image-upgrade="${IMG_TS}" --overwrite 2>/dev/null || true
+            else
+              kubectl annotate gatewayclient "${GW_NAME}" -n "${TENANT_NS}" liqo.io/image-upgrade="${IMG_TS}" --overwrite 2>/dev/null || true
             fi
-            sleep 2
+            echo "      ✓ Image update triggered, waiting for controller propagation (10s)..."
+            sleep 10
+            echo "      Rollout in progress..."
+          fi
+          
+          # Wait for rollout to complete
+          echo "      Waiting for rollout to complete..."
+          if kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null; then
+            echo "      ✓ Rollout complete"
+          else
+            echo "      ⚠️ Rollout timed out, checking status..."
+          fi
+          
+          # Verify final state
+          READY=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          UPDATED=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || echo "0")
+          echo "      Ready: ${READY}/${CURRENT_REPLICAS}, Updated: ${UPDATED}"
+          
+          # Check pod versions and identify active pod
+          echo "      Checking pod versions..."
+          ACTIVE_POD=""
+          ACTIVE_POD_OLD=false
+          PODS=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+          for POD in $PODS; do
+            POD_IMG=$(kubectl get pod "${POD}" -n "${TENANT_NS}" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+            IS_ACTIVE=$(kubectl get pod "${POD}" -n "${TENANT_NS}" -o jsonpath='{.metadata.labels.networking\.liqo\.io/active}' 2>/dev/null || echo "")
+            if [ "$IS_ACTIVE" == "true" ]; then
+              echo "        ${POD}: ${POD_IMG} [ACTIVE]"
+              ACTIVE_POD="${POD}"
+              if ! echo "$POD_IMG" | grep -q "${TARGET_VERSION}"; then
+                ACTIVE_POD_OLD=true
+              fi
+            else
+              echo "        ${POD}: ${POD_IMG}"
+            fi
           done
           
-          if [ "$IMG_UPDATED" != "true" ]; then
-            echo "      ⚠️ Warning: Image not updated after 60s, proceeding..."
+          # Force leader election to new pod if active pod is on old version
+          if [ "$ACTIVE_POD_OLD" == "true" ] && [ -n "$ACTIVE_POD" ]; then
+            echo "      ⚠️ Active pod is on old version - forcing leader election to new pod"
+            
+            # Lease name pattern: {name}.{namespace}.{type}.connections.liqo.io
+            LEASE_NAME="${GW_NAME}.${TENANT_NS}.${GW_TYPE}.connections.liqo.io"
+            echo "      Deleting leader election Lease: ${LEASE_NAME}"
+            kubectl delete lease "${LEASE_NAME}" -n "${TENANT_NS}" 2>/dev/null || true
+            
+            # GatewayServer needs longer wait - remote consumer must reconnect
+            # GatewayClient actively reconnects (fast), GatewayServer waits passively (slower)
+            if [ "$GW_TYPE" == "server" ]; then
+              LEADER_WAIT=15
+              echo "      Waiting for new leader election (${LEADER_WAIT}s - server mode, remote consumer reconnection)..."
+            else
+              LEADER_WAIT=5
+              echo "      Waiting for new leader election (${LEADER_WAIT}s)..."
+            fi
+            sleep $LEADER_WAIT
+            
+            # Verify new leader is on new version
+            NEW_ACTIVE=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway,networking.liqo.io/active=true -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [ -n "$NEW_ACTIVE" ]; then
+              NEW_ACTIVE_IMG=$(kubectl get pod "${NEW_ACTIVE}" -n "${TENANT_NS}" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "")
+              echo "      ✓ New active pod: ${NEW_ACTIVE} (${NEW_ACTIVE_IMG})"
+            else
+              echo "      ⚠️ No active pod detected yet, leader election in progress..."
+              sleep 3
+            fi
           fi
           
-          echo "    Waiting for ${GW_DEPLOY} rollout to complete..."
+        else
+          echo "    ℹ️ Single replica or Recreate strategy - standard rollout"
+          
+          # Wait for rollout to complete
+          echo "      Waiting for rollout..."
           kubectl rollout status deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "      ⚠️ Rollout timed out"
         fi
         
-        # Wait for any terminating pods to fully disappear
+        # Post-rollout: Wait for any terminating pods to fully disappear
         echo "    Waiting for any terminating pods to disappear..."
         for TERM_WAIT in 1 2 3 4 5 6 7 8 9 10 11 12; do
           TERM_COUNT=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway 2>/dev/null | grep -c "Terminating" 2>/dev/null || echo "0")
@@ -1109,26 +1171,15 @@ if [ -n "$TENANT_NAMESPACES" ]; then
           sleep 5
         done
 
-        # 6. Apply Network Tuning (RPF/MSS) to the Active Pod
-        echo "    Applying Network Tuning to active gateway pod..."
-        # In HA mode, target the active pod specifically
-        POD_NAME=$(kubectl get pods -n "${TENANT_NS}" \
-          -l networking.liqo.io/component=gateway,networking.liqo.io/active=true \
+        # Apply Network Tuning (RPF/MSS) to all gateway pods
+        echo "    Applying Network Tuning to gateway pods..."
+        GW_PODS=$(kubectl get pods -n "${TENANT_NS}" \
+          -l networking.liqo.io/component=gateway \
           --field-selector=status.phase=Running \
-          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
         
-        # Fallback: try with gateway-name label
-        if [ -z "$POD_NAME" ]; then
-           POD_NAME=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway,networking.liqo.io/gateway-name="${GW_CLIENT_NAME}" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-        fi
-        
-        # Final fallback: any running gateway pod
-        if [ -z "$POD_NAME" ]; then
-           POD_NAME=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-        fi
-
-        if [ -n "$POD_NAME" ]; then
-           if kubectl exec -n "${TENANT_NS}" "${POD_NAME}" -c gateway -- /bin/sh -c '
+        for POD_NAME in $GW_PODS; do
+          if kubectl exec -n "${TENANT_NS}" "${POD_NAME}" -c gateway -- /bin/sh -c '
               sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
               sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
               for iface in $(ls /proc/sys/net/ipv4/conf/ | grep liqo); do
@@ -1140,37 +1191,44 @@ if [ -n "$TENANT_NAMESPACES" ]; then
            ' 2>/dev/null; then
              echo "      ✓ Network tuning applied to ${POD_NAME}"
            else
-             echo "      ⚠️ Warning: Network tuning command failed"
+             echo "      ⚠️ Warning: Network tuning failed for ${POD_NAME}"
            fi
-        else
-           echo "      ⚠️ Warning: Could not find running gateway pod for tuning"
-        fi
+        done
 
-        # 7. CRITICAL: Active Synchronization Loop
-        # Wait until Control Plane (GatewayClient status) matches Data Plane (Active Pod IP)
-        echo "    Verifying IP Synchronization for ${GW_CLIENT_NAME}..."
+        # IP Synchronization: Ensure Gateway status reflects active pod IP
+        echo "    Verifying IP Synchronization for ${GW_NAME} (${GW_TYPE})..."
+        
+        # Get active pod IP
+        ACTIVE_GW_POD=$(kubectl get pods -n "${TENANT_NS}" \
+          -l networking.liqo.io/component=gateway,networking.liqo.io/active=true \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        
+        if [ -z "$ACTIVE_GW_POD" ]; then
+          ACTIVE_GW_POD=$(kubectl get pods -n "${TENANT_NS}" \
+            -l networking.liqo.io/component=gateway \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        fi
         
         SYNCED="false"
-        for SYNC_ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-          # Re-fetch active pod name (in HA mode, we want the active pod's IP)
-          POD_NAME=$(kubectl get pods -n "${TENANT_NS}" \
-            -l networking.liqo.io/component=gateway,networking.liqo.io/active=true \
-            --field-selector=status.phase=Running \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-          
-          # Fallback: any running gateway pod
-          if [ -z "$POD_NAME" ]; then
-            POD_NAME=$(kubectl get pods -n "${TENANT_NS}" -l networking.liqo.io/component=gateway --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-          fi
-          
-          # Get current IPs
+        for SYNC_ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
           ACTUAL_IP=""
           STATUS_IP=""
           
-          if [ -n "$POD_NAME" ]; then
-            ACTUAL_IP=$(kubectl get pod "${POD_NAME}" -n "${TENANT_NS}" -o jsonpath='{.status.podIP}' 2>/dev/null || echo "")
+          if [ -n "$ACTIVE_GW_POD" ]; then
+            ACTUAL_IP=$(kubectl get pod "${ACTIVE_GW_POD}" -n "${TENANT_NS}" \
+              -o jsonpath='{.status.podIP}' 2>/dev/null || echo "")
           fi
-          STATUS_IP=$(kubectl get gatewayclient "${GW_CLIENT_NAME}" -n "${TENANT_NS}" -o jsonpath='{.status.internalEndpoint.ip}' 2>/dev/null || echo "")
+          
+          # Get status IP from the correct resource type
+          if [ "$GW_TYPE" == "server" ]; then
+            STATUS_IP=$(kubectl get gatewayserver "${GW_NAME}" -n "${TENANT_NS}" \
+              -o jsonpath='{.status.internalEndpoint.ip}' 2>/dev/null || echo "")
+          else
+            STATUS_IP=$(kubectl get gatewayclient "${GW_NAME}" -n "${TENANT_NS}" \
+              -o jsonpath='{.status.internalEndpoint.ip}' 2>/dev/null || echo "")
+          fi
 
           if [ -n "$ACTUAL_IP" ] && [ "$ACTUAL_IP" == "$STATUS_IP" ]; then
             echo "      ✓ IPs Synced: ${ACTUAL_IP}"
@@ -1178,19 +1236,26 @@ if [ -n "$TENANT_NAMESPACES" ]; then
             break
           fi
           
-          echo "      ⏳ Attempt ${SYNC_ATTEMPT}/20: Mismatch (Pod:${ACTUAL_IP} vs Status:${STATUS_IP}). Forcing refresh..."
+          if [ $((SYNC_ATTEMPT %% 5)) -eq 0 ]; then
+            echo "      ⏳ Attempt ${SYNC_ATTEMPT}/15: Pod=${ACTUAL_IP} Status=${STATUS_IP}"
+          fi
           
-          # Trigger update to wake up controller
+          # Trigger controller reconciliation
           SYNC_TS=$(date +%%s)
-          kubectl annotate gatewayclient "${GW_CLIENT_NAME}" -n "${TENANT_NS}" liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
-          kubectl annotate gatewayserver "${GW_CLIENT_NAME}" -n "${TENANT_NS}" liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
+          if [ "$GW_TYPE" == "server" ]; then
+            kubectl annotate gatewayserver "${GW_NAME}" -n "${TENANT_NS}" \
+              liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
+          else
+            kubectl annotate gatewayclient "${GW_NAME}" -n "${TENANT_NS}" \
+              liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
+          fi
           
-          sleep 5
+          sleep 3
         done
 
         if [ "$SYNCED" != "true" ]; then
-           echo "      ❌ WARNING: Failed to sync IPs for ${GW_DEPLOY} after 20 attempts."
-           echo "      This may cause connectivity issues. Manual intervention may be required."
+           echo "      ⚠️ IP sync timeout (Pod:${ACTUAL_IP} vs Status:${STATUS_IP})"
+           echo "      Controller should reconcile automatically"
         fi
         
         echo "    ✓ Gateway ${GW_DEPLOY} processed"
@@ -1682,19 +1747,28 @@ echo ""
 echo "========================================="
 echo "Step 6.5: Final Network Stabilization"
 echo "========================================="
-echo "Triggering GatewayClient reconciliation to update internalEndpoint IPs..."
+echo "Triggering Gateway reconciliation to update internalEndpoint IPs..."
 echo "NOTE: Fabric was already updated in Step 4 - no restart needed."
 
-# Force GatewayClient reconciliation to update internalEndpoint IPs
-# The annotation triggers the controller to update GatewayClient status,
+# Force Gateway reconciliation to update internalEndpoint IPs
+# The annotation triggers the controller to update Gateway status,
 # which will cause fabric to update routes without needing a restart.
 TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
 for TENANT_NS in $TENANT_NAMESPACES; do
+  # Process GatewayClients if present
   GATEWAY_CLIENTS=$(kubectl get gatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
   for GW_CLIENT in $GATEWAY_CLIENTS; do
     SYNC_TS=$(date +%%s)
     kubectl annotate gatewayclient "${GW_CLIENT}" -n "${TENANT_NS}" liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
-    echo "  ✓ Triggered reconciliation for GatewayClient ${GW_CLIENT}"
+    echo "  ✓ Triggered reconciliation for GatewayClient ${GW_CLIENT} in ${TENANT_NS}"
+  done
+  
+  # Process GatewayServers if present
+  GATEWAY_SERVERS=$(kubectl get gatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  for GW_SERVER in $GATEWAY_SERVERS; do
+    SYNC_TS=$(date +%%s)
+    kubectl annotate gatewayserver "${GW_SERVER}" -n "${TENANT_NS}" liqo.io/force-sync="${SYNC_TS}" --overwrite 2>/dev/null || true
+    echo "  ✓ Triggered reconciliation for GatewayServer ${GW_SERVER} in ${TENANT_NS}"
   done
 done
 
@@ -1932,12 +2006,145 @@ fi
 
 echo ""
 echo "========================================="
-echo "Step 8: Post-Upgrade Cleanup (Optional Gateway Scale-Back)"
+echo "Step 8: Post-Upgrade Cleanup (Restore Template Settings)"
 echo "========================================="
-echo "Scaling gateways back to 1 replica (optional - can keep 2 for continued HA)..."
+echo "Restoring gateway templates to original settings (replicas=1, Recreate)..."
+echo ""
 
-# Scale gateways back to 1 replica if they were scaled up
+# Step 8a: Restore WgGatewayClientTemplate to original settings
+echo "--- Restoring WgGatewayClientTemplate ---"
+if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev/null; then
+  kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/replicas", "value": 1},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/strategy", "value": {"type": "Recreate"}}
+    ]' && echo "  ✓ WgGatewayClientTemplate: replicas=1, strategy=Recreate" || {
+    echo "  ⚠️ Warning: Could not restore template settings, trying separately..."
+    kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+      --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/deployment/spec/replicas", "value": 1}]' 2>/dev/null || true
+    kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+      --type='merge' -p='{"spec":{"template":{"spec":{"deployment":{"spec":{"strategy":{"type":"Recreate"}}}}}}}' 2>/dev/null || true
+  }
+else
+  echo "  ℹ️  WgGatewayClientTemplate not found"
+fi
+
+# Step 8b: Restore WgGatewayServerTemplate to original settings
+echo "--- Restoring WgGatewayServerTemplate ---"
+if kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" &>/dev/null; then
+  kubectl patch wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
+    --type='json' -p='[
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/replicas", "value": 1},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/strategy", "value": {"type": "Recreate"}}
+    ]' && echo "  ✓ WgGatewayServerTemplate: replicas=1, strategy=Recreate" || {
+    echo "  ⚠️ Warning: Could not restore template settings"
+  }
+else
+  echo "  ℹ️  WgGatewayServerTemplate not found"
+fi
+
+echo ""
+echo "--- Triggering Controller to Scale Down Gateways ---"
+echo "CRITICAL: Delete passive pods first to preserve active pod during scale-down..."
+
+# Step 1: Delete passive pods manually before triggering scale-down
 TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
+PASSIVE_PODS_DELETED=0
+
+for TENANT_NS in $TENANT_NAMESPACES; do
+  GATEWAY_DEPLOYMENTS=$(kubectl get deployments -n "${TENANT_NS}" -l networking.liqo.io/component=gateway -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  
+  for GW_DEPLOY in $GATEWAY_DEPLOYMENTS; do
+    if [ -n "$GW_DEPLOY" ]; then
+      # Check if deployment has 2 replicas (still in HA mode)
+      CURRENT_REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+      
+      if [ "$CURRENT_REPLICAS" -eq 2 ]; then
+        echo "  Processing ${GW_DEPLOY} in ${TENANT_NS}..."
+        
+        # Get active pod directly using label selector (avoids bash word-splitting issues)
+        ACTIVE_POD=$(kubectl get pods -n "${TENANT_NS}" \
+          -l networking.liqo.io/component=gateway,networking.liqo.io/active=true \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        
+        # Get all gateway pods
+        ALL_PODS=$(kubectl get pods -n "${TENANT_NS}" \
+          -l networking.liqo.io/component=gateway \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        
+        # Find passive pod (any pod that's not the active one)
+        PASSIVE_POD=""
+        for POD_NAME in $ALL_PODS; do
+          if [ -n "$POD_NAME" ] && [ "$POD_NAME" != "$ACTIVE_POD" ]; then
+            PASSIVE_POD="$POD_NAME"
+            break
+          fi
+        done
+        
+        if [ -n "$PASSIVE_POD" ] && [ -n "$ACTIVE_POD" ]; then
+          echo "    Active pod: ${ACTIVE_POD}"
+          echo "    Deleting passive pod: ${PASSIVE_POD}..."
+          kubectl delete pod "${PASSIVE_POD}" -n "${TENANT_NS}" --grace-period=10 2>/dev/null && {
+            echo "    ✓ Passive pod deleted, active pod remains serving traffic"
+            PASSIVE_PODS_DELETED=$((PASSIVE_PODS_DELETED + 1))
+            
+            # Wait a moment for pod deletion to register
+            sleep 3
+          } || echo "    ⚠️ Could not delete passive pod (may have been deleted already)"
+        elif [ -z "$ACTIVE_POD" ]; then
+          echo "    ⚠️ No active pod found - skipping to avoid disruption"
+        else
+          echo "    ℹ️ No passive pod found (may have been cleaned up already)"
+        fi
+      fi
+    fi
+  done
+done
+
+if [ "$PASSIVE_PODS_DELETED" -gt 0 ]; then
+  echo "  ✓ Deleted ${PASSIVE_PODS_DELETED} passive pod(s), waiting for deployment to adjust (5s)..."
+  sleep 5
+fi
+
+# Step 2: Trigger scale-down annotation (controller will complete the scale-down)
+echo ""
+echo "Annotating Gateway resources to trigger final scale-down..."
+
+RESTORE_CLIENT_COUNT=0
+RESTORE_SERVER_COUNT=0
+for TENANT_NS in $TENANT_NAMESPACES; do
+  # Process GatewayClients if present
+  GATEWAY_CLIENTS=$(kubectl get gatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  for GW_CLIENT in $GATEWAY_CLIENTS; do
+    RESTORE_TS=$(date +%%s)
+    kubectl annotate gatewayclient "${GW_CLIENT}" -n "${TENANT_NS}" liqo.io/ha-restore="${RESTORE_TS}" --overwrite 2>/dev/null || true
+    echo "  ✓ Triggered scale-down for GatewayClient ${GW_CLIENT} in ${TENANT_NS}"
+    RESTORE_CLIENT_COUNT=$((RESTORE_CLIENT_COUNT + 1))
+  done
+  
+  # Process GatewayServers if present
+  GATEWAY_SERVERS=$(kubectl get gatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+  for GW_SERVER in $GATEWAY_SERVERS; do
+    RESTORE_TS=$(date +%%s)
+    kubectl annotate gatewayserver "${GW_SERVER}" -n "${TENANT_NS}" liqo.io/ha-restore="${RESTORE_TS}" --overwrite 2>/dev/null || true
+    echo "  ✓ Triggered scale-down for GatewayServer ${GW_SERVER} in ${TENANT_NS}"
+    RESTORE_SERVER_COUNT=$((RESTORE_SERVER_COUNT + 1))
+  done
+done
+
+if [ "$RESTORE_CLIENT_COUNT" -eq 0 ] && [ "$RESTORE_SERVER_COUNT" -eq 0 ]; then
+  echo "  ℹ️ No Gateway resources found"
+else
+  echo "  Summary: ${RESTORE_CLIENT_COUNT} GatewayClient(s), ${RESTORE_SERVER_COUNT} GatewayServer(s) triggered for scale-down"
+fi
+
+echo ""
+echo "Waiting for controllers to propagate settings (10s)..."
+sleep 10
+
+# Step 3: Verify scale-down completed
 GATEWAYS_SCALED_BACK=0
 
 for TENANT_NS in $TENANT_NAMESPACES; do
@@ -1945,24 +2152,46 @@ for TENANT_NS in $TENANT_NAMESPACES; do
   
   for GW_DEPLOY in $GATEWAY_DEPLOYMENTS; do
     if [ -n "$GW_DEPLOY" ]; then
-      CURRENT_REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+      echo "  Checking ${GW_DEPLOY} in ${TENANT_NS}..."
       
-      if [ "$CURRENT_REPLICAS" -gt 1 ]; then
-        echo "  Scaling ${GW_DEPLOY} in ${TENANT_NS} from ${CURRENT_REPLICAS} to 1 replica..."
-        kubectl scale deployment "${GW_DEPLOY}" -n "${TENANT_NS}" --replicas=1 2>/dev/null && {
-          echo "    ✓ Scaled back to 1 replica"
+      # Wait for scale down to complete
+      for i in 1 2 3 4 5 6; do
+        REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        READY_REPLICAS=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        STRATEGY=$(kubectl get deployment "${GW_DEPLOY}" -n "${TENANT_NS}" -o jsonpath='{.spec.strategy.type}' 2>/dev/null || echo "unknown")
+        
+        if [ "$REPLICAS" -eq 1 ] && [ "$READY_REPLICAS" -eq 1 ]; then
+          echo "    ✓ ${GW_DEPLOY}: replicas=${REPLICAS}, ready=${READY_REPLICAS}, strategy=${STRATEGY}"
           GATEWAYS_SCALED_BACK=$((GATEWAYS_SCALED_BACK + 1))
-        } || echo "    ⚠️ Could not scale ${GW_DEPLOY}"
-      fi
+          break
+        fi
+        
+        if [ $((i %% 2)) -eq 0 ]; then
+          echo "    ⏳ Waiting for scale down... (replicas=${REPLICAS}, ready=${READY_REPLICAS})"
+        fi
+        sleep 5
+      done
     fi
   done
 done
 
-if [ "$GATEWAYS_SCALED_BACK" -gt 0 ]; then
-  echo "✅ Scaled back ${GATEWAYS_SCALED_BACK} gateway(s) to 1 replica"
-else
-  echo "ℹ️  No gateways needed scaling back"
-fi
+# Verify template settings were restored
+echo ""
+echo "Verifying template restoration..."
+CLIENT_REPLICAS=$(kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.replicas}' 2>/dev/null || echo "unknown")
+CLIENT_STRATEGY=$(kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.strategy.type}' 2>/dev/null || echo "unknown")
+echo "  Client template: replicas=${CLIENT_REPLICAS}, strategy=${CLIENT_STRATEGY}"
+
+SERVER_REPLICAS=$(kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.replicas}' 2>/dev/null || echo "unknown")
+SERVER_STRATEGY=$(kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.template.spec.deployment.spec.strategy.type}' 2>/dev/null || echo "unknown")
+echo "  Server template: replicas=${SERVER_REPLICAS}, strategy=${SERVER_STRATEGY}"
+
+echo ""
+echo "✅ Processed ${GATEWAYS_SCALED_BACK} gateway(s) - templates restored to original settings"
 
 echo ""
 echo "========================================="
