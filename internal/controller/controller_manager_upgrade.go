@@ -33,14 +33,6 @@ import (
 	upgradev1alpha1 "github.com/thisiskazem/liqo-upgrade-controller/api/v1alpha1"
 )
 
-// Core control-plane components in upgrade order
-var coreControlPlaneComponents = []string{
-	"liqo-controller-manager",
-	"liqo-crd-replicator",
-	"liqo-metric-agent",
-	// liqo-webhook is handled last with special logic
-}
-
 // Stage 2: Upgrade core control-plane components
 func (r *LiqoUpgradeReconciler) startControllerManagerUpgrade(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)

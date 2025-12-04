@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -518,28 +517,4 @@ func sanitizeJobName(name string) string {
 		result = result[:len(result)-1]
 	}
 	return result
-}
-
-// getTargetDescriptorFromConfigMap retrieves a target descriptor from the ConfigMap
-func (r *LiqoUpgradeReconciler) getTargetDescriptorFromConfigMap(ctx context.Context, version, namespace string) (*TargetDescriptor, error) {
-	configMap := &corev1.ConfigMap{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      targetDescriptorsConfigMap,
-		Namespace: namespace,
-	}, configMap)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get target descriptors ConfigMap: %w", err)
-	}
-
-	descriptorJSON, ok := configMap.Data[version+".json"]
-	if !ok {
-		return nil, fmt.Errorf("no descriptor found for version %s", version)
-	}
-
-	var descriptor TargetDescriptor
-	if err := json.Unmarshal([]byte(descriptorJSON), &descriptor); err != nil {
-		return nil, fmt.Errorf("failed to parse target descriptor for %s: %w", version, err)
-	}
-
-	return &descriptor, nil
 }
