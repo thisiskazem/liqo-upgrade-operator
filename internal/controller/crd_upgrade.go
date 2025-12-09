@@ -103,7 +103,7 @@ func (r *LiqoUpgradeReconciler) buildCRDUpgradeJob(upgrade *upgradev1alpha1.Liqo
 	jobName := fmt.Sprintf("%s-%s", crdUpgradeJobPrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
-		namespace = "liqo"
+		namespace = defaultLiqoNamespace
 	}
 
 	script := fmt.Sprintf(`#!/bin/bash
@@ -435,7 +435,7 @@ func (r *LiqoUpgradeReconciler) analyzeCRDChanges(ctx context.Context, upgrade *
 
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
-		namespace = "liqo"
+		namespace = defaultLiqoNamespace
 	}
 
 	// Load old CRDs from snapshot

@@ -45,6 +45,7 @@ const (
 	rollbackJobPrefix              = "liqo-rollback"
 	compatibilityConfigMap         = "liqo-version-compatibility"
 	targetDescriptorsConfigMap     = "liqo-target-descriptors"
+	defaultLiqoNamespace           = "liqo"
 )
 
 // +kubebuilder:rbac:groups=upgrade.liqo.io,resources=liqoupgrades,verbs=get;list;watch;create;update;patch;delete
@@ -72,7 +73,7 @@ func (r *LiqoUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Handle deletion
-	if !upgrade.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !upgrade.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, upgrade)
 	}
 

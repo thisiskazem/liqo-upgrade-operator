@@ -112,7 +112,7 @@ func (r *LiqoUpgradeReconciler) buildNetworkFabricUpgradeJob(upgrade *upgradev1a
 	jobName := fmt.Sprintf("%s-%s", networkFabricUpgradePrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
-		namespace = "liqo"
+		namespace = defaultLiqoNamespace
 	}
 
 	// Generate backup ConfigMap name (BackupName field planned for future implementation)
@@ -151,6 +151,7 @@ TARGET_VERSION="%s"
 NAMESPACE="%s"
 BACKUP_CONFIGMAP="%s"
 PLAN_CONFIGMAP="%s"
+IMAGE_REGISTRY="%s"
 
 # Load upgrade plan
 echo "Loading upgrade plan from ConfigMap ${PLAN_CONFIGMAP}..."
@@ -162,9 +163,12 @@ if [ -z "$PLAN_JSON" ]; then
 fi
 
 echo "Upgrade plan loaded"
-echo ""
 
+echo ""
+echo "========================================="
 echo "Step 1: Backing up network fabric deployments..."
+echo "========================================="
+echo ""
 mkdir -p /tmp/network-backup
 
 # Find all liqo-tenant-* namespaces for gateway deployments
@@ -197,8 +201,10 @@ if kubectl get deployment liqo-proxy -n "${NAMESPACE}" &>/dev/null; then
 fi
 
 echo ""
-echo "Step 2: Validating WireGuard/Geneve Prerequisites..."
-
+echo "========================================="
+echo "Step 2: Validating WireGuard/Geneve prerequisites..."
+echo "========================================="
+echo ""
 # Check for WireGuard keys and configuration
 echo "Checking WireGuard keys and secrets..."
 WG_SECRETS=$(kubectl get secrets -n "${NAMESPACE}" -l "liqo.io/component=gateway" -o jsonpath='{.items[*].metadata.name}' || echo "")
@@ -228,8 +234,9 @@ fi
 
 echo ""
 echo "========================================="
-echo "Step 3: Gateway Template HA Configuration"
+echo "Step 3: Enabling Gateway HA mode in templates"
 echo "========================================="
+echo ""
 echo "CRITICAL: We must patch templates for HA BEFORE updating images."
 echo "This is the ONLY way to achieve zero-downtime gateway upgrade."
 echo ""
@@ -241,8 +248,8 @@ echo "Strategy: Patch templates with replicas=2 + RollingUpdate,"
 echo "          then update images. RollingUpdate will upgrade one pod at a time."
 echo ""
 
-# Step 3a: Enable HA mode in templates FIRST (before image update)
-echo "--- Step 3a: Enabling HA Mode in Templates ---"
+# Enable HA mode in templates FIRST (before image update)
+echo "--- Patching templates for HA ---"
 
 # Patch WgGatewayClientTemplate for HA
 if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev/null; then
@@ -281,7 +288,10 @@ else
 fi
 
 echo ""
-echo "--- Step 3b: Triggering Controller Propagation ---"
+echo "========================================="
+echo "Step 4: Triggering controller propagation..."
+echo "========================================="
+echo ""
 echo "The reconcilers do NOT watch templates automatically."
 echo "We must annotate Gateway resources to trigger re-render from template."
 echo ""
@@ -339,7 +349,10 @@ echo "  Server template: replicas=${SERVER_REPLICAS}, strategy=${SERVER_STRATEGY
 
 # Wait for deployments to have 2 replicas ready
 echo ""
-echo "--- Step 3c: Waiting for Gateway Pods to Scale Up ---"
+echo "========================================="
+echo "Step 5: Waiting for gateway pods to scale up..."
+echo "========================================="
+echo ""
 TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
 GATEWAYS_HA_READY=0
 
@@ -393,10 +406,11 @@ echo "✅ Gateway HA Mode Enabled: ${GATEWAYS_HA_READY} gateway(s) with 2 replic
 
 echo ""
 echo "========================================="
-echo "--- Step 3d: Upgrading Gateway Images ---"
+echo "Step 6: Upgrading gateway images in templates..."
 echo "========================================="
-echo "Now updating gateway images. RollingUpdate will upgrade one pod at a time."
 echo ""
+echo "Now updating gateway images. RollingUpdate will upgrade one pod at a time."
+
 
 # Upgrade WgGatewayClientTemplate images
 echo "--- Upgrading WgGatewayClientTemplate ---"
@@ -406,9 +420,9 @@ if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev
   # Patch the template to update container images
   kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
     --type='json' -p='[
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${TARGET_VERSION}"'"}
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${TARGET_VERSION}"'"}
     ]' && echo "  ✓ WgGatewayClientTemplate images updated" || echo "  ⚠️  Warning: Could not update WgGatewayClientTemplate images"
   
   # Update version labels in template
@@ -430,9 +444,9 @@ if kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" &>/dev
 
   kubectl patch wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
     --type='json' -p='[
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${TARGET_VERSION}"'"}
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${TARGET_VERSION}"'"},
+      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${TARGET_VERSION}"'"}
     ]' && echo "  ✓ WgGatewayServerTemplate images updated" || echo "  ⚠️  Warning: Could not update WgGatewayServerTemplate images"
   
   # Update version labels in template
@@ -471,12 +485,14 @@ fi
 
 echo "✅ Gateway templates upgraded successfully"
 echo ""
-echo "NOTE: Image updates will be applied in Step 5.5 after fabric is stable."
+echo "NOTE: Image updates will be applied in Step 12 after fabric is stable."
 echo "This ensures gateway upgrade happens when network is ready."
 
 echo ""
-echo "Step 4: Upgrading network components sequentially with health checks..."
-
+echo "========================================="
+echo "Step 7: Upgrading network components sequentially with health checks..."
+echo "========================================="
+echo ""
 # Function to check component health
 check_component_health() {
   local COMPONENT=$1
@@ -540,7 +556,7 @@ if kubectl get deployment liqo-ipam -n "${NAMESPACE}" &>/dev/null; then
   ENV_JSON=$(kubectl get deployment liqo-ipam -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].env}')
   echo "  Current environment variables preserved in deployment spec"
 
-  NEW_IMAGE="ghcr.io/liqotech/ipam:${TARGET_VERSION}"
+  NEW_IMAGE="${IMAGE_REGISTRY}/ipam:${TARGET_VERSION}"
   echo "New image: ${NEW_IMAGE}"
 
   CONTAINER_NAME=$(kubectl get deployment liqo-ipam -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
@@ -582,7 +598,7 @@ if kubectl get deployment liqo-proxy -n "${NAMESPACE}" &>/dev/null; then
   ENV_JSON=$(kubectl get deployment liqo-proxy -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].env}')
   echo "  Current environment variables preserved in deployment spec"
 
-  NEW_IMAGE="ghcr.io/liqotech/proxy:${TARGET_VERSION}"
+  NEW_IMAGE="${IMAGE_REGISTRY}/proxy:${TARGET_VERSION}"
   echo "New image: ${NEW_IMAGE}"
 
   CONTAINER_NAME=$(kubectl get deployment liqo-proxy -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
@@ -625,7 +641,7 @@ if kubectl get daemonset liqo-fabric -n "${NAMESPACE}" &>/dev/null; then
   ENV_JSON=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].env}')
   echo "  Current environment variables preserved in daemonset spec"
 
-  NEW_IMAGE="ghcr.io/liqotech/fabric:${TARGET_VERSION}"
+  NEW_IMAGE="${IMAGE_REGISTRY}/fabric:${TARGET_VERSION}"
   echo "New image: ${NEW_IMAGE}"
 
   CONTAINER_NAME=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
@@ -702,7 +718,7 @@ else
     echo ""
     echo "  Upgrading VK DaemonSet: ${VK_DS}"
 
-    NEW_IMAGE="ghcr.io/liqotech/virtual-kubelet:${TARGET_VERSION}"
+    NEW_IMAGE="${IMAGE_REGISTRY}/virtual-kubelet:${TARGET_VERSION}"
     CONTAINER_NAME=$(kubectl get daemonset "$VK_DS" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
 
     kubectl set image daemonset/"$VK_DS" \
@@ -728,7 +744,7 @@ else
     echo ""
     echo "  Upgrading VK Deployment: ${VK_DEP}"
 
-    NEW_IMAGE="ghcr.io/liqotech/virtual-kubelet:${TARGET_VERSION}"
+    NEW_IMAGE="${IMAGE_REGISTRY}/virtual-kubelet:${TARGET_VERSION}"
     CONTAINER_NAME=$(kubectl get deployment "$VK_DEP" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
 
     kubectl set image deployment/"$VK_DEP" \
@@ -770,12 +786,13 @@ fi
 
 echo ""
 echo "========================================="
-echo "Step 4.5: Performing Local Data Plane Reset"
+echo "Step 8: Performing local data plane reset..."
 echo "========================================="
-echo "This step cleans stale network state to ensure VPN tunnels can be re-established"
 echo ""
+echo "This step cleans stale network state to ensure VPN tunnels can be re-established"
 
-# --- NEW FIX: Clean Stale Host Interfaces ---
+
+# Clean stale host interfaces
 echo "1. Cleaning stale host interfaces..."
 # Get all fabric pods
 FABRIC_PODS=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
@@ -797,11 +814,9 @@ else
   echo "  ⚠️ No fabric pods found for interface cleanup"
 fi
 
-# --- OPTIMIZED: Annotate InternalNode resources instead of deleting ---
+# Annotate InternalNode resources to trigger reconciliation (preserves existing tunnels)
 echo ""
 echo "2. Triggering InternalNode reconciliation (zero-downtime method)..."
-# Instead of deleting InternalNodes (which causes tunnel teardown), we annotate them
-# to trigger the controller to update them in-place. This preserves existing tunnels.
 TRIGGER_TS=$(date +%%s)
 INTERNAL_NODES=$(kubectl get internalnodes -A -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
 if [ -n "$INTERNAL_NODES" ]; then
@@ -814,12 +829,7 @@ else
   echo "  ℹ️ No InternalNode resources found"
 fi
 
-# NOTE: Removed redundant liqo-fabric restart here (was Step 3)
-# Fabric was already updated in Step 4 with the new image.
-# Additional restart here just adds unnecessary disruption.
-# The fabric will naturally sync state after interface cleanup.
-
-# --- Flush conntrack to clear stale connections ---
+# Flush conntrack to clear stale connections
 echo ""
 echo "3. Flushing conntrack table to clear stale connections..."
 # Deleting network interfaces can leave stale entries in the conntrack table
@@ -838,23 +848,15 @@ else
   echo "  ⚠️ Warning: No fabric pod found for conntrack flush"
 fi
 
-# NOTE: Removed CoreDNS restart (was Step 5)
-# CoreDNS is not a Liqo component - restarting it causes unrelated DNS disruption.
-# If Liqo upgrade affects DNS connectivity, that's a Liqo bug to fix, not workaround.
-
 echo ""
 echo "✅ Local Data Plane Reset complete"
-
 echo ""
 echo "========================================="
-echo "Step 5: Restart liqo-controller-manager and regenerate InternalNodes"
+echo "Step 9: Restarting liqo-controller-manager..."
 echo "========================================="
-
-# --- OPTIMIZED: Annotate RouteConfigurations instead of deleting ---
-# For minor upgrades, RouteConfigurations don't need to be deleted.
-# Annotating them triggers the controller to update them in-place.
-# This preserves existing routes and minimizes network disruption.
-echo "  Triggering RouteConfiguration reconciliation (zero-downtime method)..."
+echo ""
+# Annotate RouteConfigurations to trigger reconciliation (preserves existing routes)
+echo "Triggering RouteConfiguration reconciliation (zero-downtime method)..."
 TRIGGER_TS=$(date +%%s)
 ROUTE_CONFIGS=$(kubectl get routeconfigurations -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
 if [ -n "$ROUTE_CONFIGS" ]; then
@@ -896,8 +898,9 @@ sleep 10
 
 echo ""
 echo "========================================="
-echo "Step 5.1: Verifying InternalNodes (Zero-Downtime Method)"
+echo "Step 10: Verifying InternalNodes..."
 echo "========================================="
+echo ""
 echo "Since we preserved InternalNodes (didn't delete them), we just verify they exist."
 echo "The controller will update them in-place via annotation triggers."
 echo ""
@@ -953,9 +956,10 @@ echo "✅ Controller Manager restarted and reconciliation triggered"
 
 echo ""
 echo "========================================="
-echo "Step 5.5: Gateway RollingUpdate Upgrade"
+echo "Step 11: Gateway rolling update upgrade..."
 echo "========================================="
-echo "Since we configured RollingUpdate strategy in Step 3, Kubernetes"
+echo ""
+echo "Since we configured RollingUpdate strategy in Steps 3-6, Kubernetes"
 echo "will automatically upgrade gateway pods one at a time."
 echo ""
 echo "The RollingUpdate process (handled by Kubernetes):"
@@ -1263,9 +1267,7 @@ if [ -n "$TENANT_NAMESPACES" ]; then
 
     echo "  ✓ ${TENANT_NS} processed"
     
-    # =========================================
-    # CANARY VERIFICATION: Verify this peering before proceeding to next
-    # =========================================
+    # Canary verification: Verify this peering before proceeding to next
     echo ""
     echo "  🐦 CANARY: Verifying peering connectivity for ${TENANT_NS}..."
     FC_NAME="${TENANT_NS#liqo-tenant-}"
@@ -1371,7 +1373,11 @@ echo ""
 echo "--- Upgrading liqo-gateway deployments ---"
 
 # Find all tenant namespaces (re-fetch after reset)
-echo "Step 1: Finding tenant namespaces..."
+echo ""
+echo "========================================="
+echo "Step 12: Processing gateway configurations..."
+echo "========================================="
+echo ""
 TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
 
 if [ -z "$TENANT_NAMESPACES" ]; then
@@ -1385,7 +1391,7 @@ else
     FC="${TENANT_NS#liqo-tenant-}"
     echo "--- Processing tenant namespace: ${TENANT_NS} ---"
 
-    # Step 1: Clear GatewayClient status (if exists)
+    # Clear GatewayClient status (if exists)
     GATEWAY_CLIENTS=$(kubectl get gatewayclient -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     if [ -n "$GATEWAY_CLIENTS" ]; then
       for GW_CLIENT in ${GATEWAY_CLIENTS}; do
@@ -1398,7 +1404,7 @@ else
       done
     fi
 
-    # Step 2: Clear GatewayServer status (if exists)
+    # Clear GatewayServer status (if exists)
     GATEWAY_SERVERS=$(kubectl get gatewayserver -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     if [ -n "$GATEWAY_SERVERS" ]; then
       for GW_SERVER in ${GATEWAY_SERVERS}; do
@@ -1411,7 +1417,7 @@ else
       done
     fi
 
-    # Step 3: Annotate Identity resources (without deleting kubeconfig secrets)
+    # Annotate Identity resources (without deleting kubeconfig secrets)
     IDENTITY_RESOURCES=$(kubectl get identity -n "${TENANT_NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     if [ -n "$IDENTITY_RESOURCES" ]; then
       for IDENTITY_NAME in ${IDENTITY_RESOURCES}; do
@@ -1424,7 +1430,7 @@ else
       done
     fi
 
-    # Step 4: Verify Configuration resources (DO NOT modify spec.remote.cidr)
+    # Verify Configuration resources (DO NOT modify spec.remote.cidr)
     # IMPORTANT: Configuration.spec.remote.cidr contains the ACTUAL remote cluster's CIDR
     # Configuration.status.remote.cidr contains the REMAPPED CIDR for local use
     # The Liqo networking controller manages these values - DO NOT overwrite spec with status!
@@ -1461,8 +1467,10 @@ else
 fi
 
 echo ""
-echo "Step 5 (continued): Verify connectivity after restart..."
-
+echo "========================================="
+echo "Step 13: Verifying connectivity after restart..."
+echo "========================================="
+echo ""
 # Give controllers additional time to reconcile after all gateway processing
 echo "  Waiting for final reconciliation to complete..."
 sleep 15
@@ -1507,13 +1515,10 @@ fi
 
 echo ""
 echo "========================================="
-echo "Step 5.9: Data Plane Verification"
+echo "Step 14: Data plane verification..."
 echo "========================================="
-echo "Verifying routing tables without restart (fabric already updated in Step 4)..."
-
-# NOTE: Removed redundant liqo-fabric restart here.
-# Fabric was already updated with new image in Step 4.
-# We only verify routing table exists, no restart needed.
+echo ""
+echo "Verifying routing tables without restart (fabric already updated in Step 7)..."
 
 # Brief wait for route programming
 echo "  Waiting for route programming (5s)..."
@@ -1535,8 +1540,9 @@ echo "✅ Data Plane verified"
 
 echo ""
 echo "========================================="
-echo "Step 5.10: Verifying Fabric -> API Server Connectivity"
+echo "Step 15: Verifying fabric API server connectivity..."
 echo "========================================="
+echo ""
 echo "This is CRITICAL - if Fabric cannot reach API Server, routing will fail."
 echo ""
 
@@ -1563,8 +1569,6 @@ if [ -n "$FABRIC_POD" ]; then
     echo "  ⚠️ WARNING: Fabric cannot reach API Server after ${MAX_RETRIES} attempts"
     echo "  This may be temporary - proceeding with upgrade."
     echo "  Note: Fabric will retry API connection automatically."
-    # NOTE: Removed CoreDNS restart - it's not a Liqo component and doesn't help.
-    # NOTE: Removed extra fabric restart - it was already updated in Step 4.
   fi
 else
   echo "  ⚠️ Warning: No fabric pod found to verify API connectivity"
@@ -1572,8 +1576,9 @@ fi
 
 echo ""
 echo "========================================="
-echo "Step 6: Upgrading Virtual Kubelet (After Network Stabilization)"
+echo "Step 16: Upgrading Virtual Kubelet..."
 echo "========================================="
+echo ""
 echo "Virtual Kubelet must be upgraded AFTER the network fabric is stable"
 echo "to ensure proper IP remapping negotiation with IPAM."
 echo ""
@@ -1595,7 +1600,7 @@ if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/de
   # Patch the template to update the virtual-kubelet container image
   kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
     --type='json' -p='[
-      {"op": "replace", "path": "/spec/containerImage", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
+      {"op": "replace", "path": "/spec/containerImage", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${TARGET_VERSION}"'"}
     ]' && echo "  ✓ VkOptionsTemplate updated" || echo "  ⚠️  Warning: Could not update VkOptionsTemplate"
 else
   echo "  ℹ️  VkOptionsTemplate not found, skipping"
@@ -1637,7 +1642,7 @@ else
         echo "    Patching VirtualNode to update image to ${TARGET_VERSION}..."
         kubectl patch virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
           --type='json' -p='[
-            {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${TARGET_VERSION}"'"}
+            {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${TARGET_VERSION}"'"}
           ]' && echo "      ✓ VirtualNode image updated" || echo "      ⚠️  Warning: Could not update VirtualNode"
 
         VN_COUNT=$((VN_COUNT + 1))
@@ -1745,10 +1750,11 @@ echo "✅ Virtual Kubelet upgrade complete"
 
 echo ""
 echo "========================================="
-echo "Step 6.5: Final Network Stabilization"
+echo "Step 17: Final network stabilization..."
 echo "========================================="
+echo ""
 echo "Triggering Gateway reconciliation to update internalEndpoint IPs..."
-echo "NOTE: Fabric was already updated in Step 4 - no restart needed."
+echo "NOTE: Fabric was already updated in Step 7 - no restart needed."
 
 # Force Gateway reconciliation to update internalEndpoint IPs
 # The annotation triggers the controller to update Gateway status,
@@ -1779,8 +1785,10 @@ sleep 10
 echo "✓ Final network stabilization complete (zero-downtime - no fabric restart)"
 
 echo ""
-echo "Step 7: Final verification of network & data-plane..."
-
+echo "========================================="
+echo "Step 18: Final verification of network & data-plane..."
+echo "========================================="
+echo ""
 # Wait for pod updates to fully propagate
 echo "Waiting for pod updates to propagate..."
 sleep 5
@@ -1921,8 +1929,10 @@ for TENANT_NS in ${TENANT_NAMESPACES}; do
 done
 
 echo ""
-echo "Step 7 (continued): Comprehensive network connectivity verification..."
-
+echo "========================================="
+echo "Step 19: Comprehensive network connectivity verification..."
+echo "========================================="
+echo ""
 # Check fabric pods can reach API server
 echo "  Checking fabric pods API connectivity..."
 FABRIC_PODS=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[*].metadata.name}')
@@ -2006,12 +2016,13 @@ fi
 
 echo ""
 echo "========================================="
-echo "Step 8: Post-Upgrade Cleanup (Restore Template Settings)"
+echo "Step 20: Post-upgrade cleanup (restoring template settings)..."
 echo "========================================="
+echo ""
 echo "Restoring gateway templates to original settings (replicas=1, Recreate)..."
 echo ""
 
-# Step 8a: Restore WgGatewayClientTemplate to original settings
+# Restore WgGatewayClientTemplate to original settings
 echo "--- Restoring WgGatewayClientTemplate ---"
 if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev/null; then
   kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
@@ -2029,7 +2040,7 @@ else
   echo "  ℹ️  WgGatewayClientTemplate not found"
 fi
 
-# Step 8b: Restore WgGatewayServerTemplate to original settings
+# Restore WgGatewayServerTemplate to original settings
 echo "--- Restoring WgGatewayServerTemplate ---"
 if kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" &>/dev/null; then
   kubectl patch wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
@@ -2047,7 +2058,7 @@ echo ""
 echo "--- Triggering Controller to Scale Down Gateways ---"
 echo "CRITICAL: Delete passive pods first to preserve active pod during scale-down..."
 
-# Step 1: Delete passive pods manually before triggering scale-down
+# Delete passive pods manually before triggering scale-down
 TENANT_NAMESPACES=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^liqo-tenant-' || true)
 PASSIVE_PODS_DELETED=0
 
@@ -2108,7 +2119,7 @@ if [ "$PASSIVE_PODS_DELETED" -gt 0 ]; then
   sleep 5
 fi
 
-# Step 2: Trigger scale-down annotation (controller will complete the scale-down)
+# Trigger scale-down annotation (controller will complete the scale-down)
 echo ""
 echo "Annotating Gateway resources to trigger final scale-down..."
 
@@ -2144,7 +2155,7 @@ echo ""
 echo "Waiting for controllers to propagate settings (10s)..."
 sleep 10
 
-# Step 3: Verify scale-down completed
+# Verify scale-down completed
 GATEWAYS_SCALED_BACK=0
 
 for TENANT_NS in $TENANT_NAMESPACES; do
@@ -2205,7 +2216,7 @@ echo "✅ Gateway IP synchronization verified"
 echo "✅ Canary verification passed for all peerings"
 echo "✅ Virtual Kubelet upgraded with IPAM env var"
 echo "========================================="
-`, upgrade.Spec.TargetVersion, namespace, backupConfigMapName, planConfigMap)
+`, upgrade.Spec.TargetVersion, namespace, backupConfigMapName, planConfigMap, upgrade.Spec.GetImageRegistry())
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

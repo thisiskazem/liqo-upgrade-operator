@@ -107,7 +107,7 @@ func (r *LiqoUpgradeReconciler) buildRollbackJob(upgrade *upgradev1alpha1.LiqoUp
 	jobName := fmt.Sprintf("%s-%s", rollbackJobPrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
-		namespace = "liqo"
+		namespace = defaultLiqoNamespace
 	}
 
 	// Determine which phase failed to decide rollback scope
@@ -127,6 +127,7 @@ echo ""
 PREVIOUS_VERSION="%s"
 NAMESPACE="%s"
 FAILED_PHASE="%s"
+IMAGE_REGISTRY="%s"
 
 # Determine rollback scope based on failed phase
 # Cumulative rollback: always rollback from the failed phase down to CRDs
@@ -185,9 +186,9 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     for TEMPLATE in ${WGGW_CLIENT_TEMPLATES}; do
       echo "  Rolling back WgGatewayClientTemplate: ${TEMPLATE}"
       kubectl patch wggatewayclienttemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' -p='[
-        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
       ]' 2>/dev/null || echo "    Warning: Could not patch template"
@@ -198,9 +199,9 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     for TEMPLATE in ${WGGW_SERVER_TEMPLATES}; do
       echo "  Rolling back WgGatewayServerTemplate: ${TEMPLATE}"
       kubectl patch wggatewayservertemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' -p='[
-        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
       ]' 2>/dev/null || echo "    Warning: Could not patch template"
@@ -213,9 +214,9 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
       GATEWAY_COUNT=$((GATEWAY_COUNT + 1))
 
       kubectl patch wggatewayclient "${WGGW_CLIENT}" -n "${TENANT_NS}" --type='json' -p='[
-        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"}
+        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${PREVIOUS_VERSION}"'"}
       ]' 2>/dev/null || echo "    Warning: Could not patch wggatewayclient"
     done
 
@@ -226,9 +227,9 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
       GATEWAY_COUNT=$((GATEWAY_COUNT + 1))
 
       kubectl patch wggatewayserver "${WGGW_SERVER}" -n "${TENANT_NS}" --type='json' -p='[
-        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/gateway:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/1/image", "value": "ghcr.io/liqotech/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/2/image", "value": "ghcr.io/liqotech/gateway/geneve:'"${PREVIOUS_VERSION}"'"}
+        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${PREVIOUS_VERSION}"'"}
       ]' 2>/dev/null || echo "    Warning: Could not patch wggatewayserver"
     done
 
@@ -237,9 +238,9 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     for GW in ${GATEWAY_DEPLOYMENTS}; do
       echo "  Rolling back gateway deployment: ${GW}"
       kubectl set image deployment/"${GW}" \
-        gateway=ghcr.io/liqotech/gateway:${PREVIOUS_VERSION} \
-        wireguard=ghcr.io/liqotech/gateway/wireguard:${PREVIOUS_VERSION} \
-        geneve=ghcr.io/liqotech/gateway/geneve:${PREVIOUS_VERSION} \
+        gateway=${IMAGE_REGISTRY}/gateway:${PREVIOUS_VERSION} \
+        wireguard=${IMAGE_REGISTRY}/gateway/wireguard:${PREVIOUS_VERSION} \
+        geneve=${IMAGE_REGISTRY}/gateway/geneve:${PREVIOUS_VERSION} \
         -n "${TENANT_NS}" 2>/dev/null || echo "    Warning: Could not update deployment"
       kubectl rollout status deployment/"${GW}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "    Warning: Rollout did not complete"
     done
@@ -253,7 +254,7 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     echo ""
     echo "Rolling back liqo-ipam..."
     CONTAINER_NAME=$(kubectl get deployment liqo-ipam -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    kubectl set image deployment/liqo-ipam "${CONTAINER_NAME}=ghcr.io/liqotech/ipam:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    kubectl set image deployment/liqo-ipam "${CONTAINER_NAME}=${IMAGE_REGISTRY}/ipam:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
     kubectl patch deployment liqo-ipam -n "${NAMESPACE}" --type=json \
       -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
            {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
@@ -266,7 +267,7 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     echo ""
     echo "Rolling back liqo-proxy..."
     CONTAINER_NAME=$(kubectl get deployment liqo-proxy -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    kubectl set image deployment/liqo-proxy "${CONTAINER_NAME}=ghcr.io/liqotech/proxy:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    kubectl set image deployment/liqo-proxy "${CONTAINER_NAME}=${IMAGE_REGISTRY}/proxy:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
     kubectl patch deployment liqo-proxy -n "${NAMESPACE}" --type=json \
       -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
            {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
@@ -279,7 +280,7 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     echo ""
     echo "Rolling back liqo-fabric..."
     CONTAINER_NAME=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    kubectl set image daemonset/liqo-fabric "${CONTAINER_NAME}=ghcr.io/liqotech/fabric:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    kubectl set image daemonset/liqo-fabric "${CONTAINER_NAME}=${IMAGE_REGISTRY}/fabric:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
     kubectl patch daemonset liqo-fabric -n "${NAMESPACE}" --type=json \
       -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
            {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
@@ -309,7 +310,7 @@ if [ "$ROLLBACK_CORE" = "true" ]; then
       echo ""
       echo "Rolling back ${COMPONENT}..."
       CONTAINER_NAME=$(kubectl get deployment "${COMPONENT}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-      kubectl set image deployment/"${COMPONENT}" "${CONTAINER_NAME}=ghcr.io/liqotech/${IMAGE_NAME}:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+      kubectl set image deployment/"${COMPONENT}" "${CONTAINER_NAME}=${IMAGE_REGISTRY}/${IMAGE_NAME}:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
       
       # Update labels
       kubectl patch deployment "${COMPONENT}" -n "${NAMESPACE}" --type=json \
@@ -335,14 +336,14 @@ if [ "$ROLLBACK_CORE" = "true" ]; then
     echo ""
     echo "Rolling back liqo-metric-agent..."
     CONTAINER_NAME=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-    kubectl set image deployment/liqo-metric-agent "${CONTAINER_NAME}=ghcr.io/liqotech/metric-agent:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    kubectl set image deployment/liqo-metric-agent "${CONTAINER_NAME}=${IMAGE_REGISTRY}/metric-agent:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
     
     # Rollback init container (cert-creator)
     INIT_EXISTS=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.initContainers[0].name}' 2>/dev/null || echo "")
     if [ -n "$INIT_EXISTS" ]; then
       echo "  Rolling back cert-creator init container..."
       kubectl patch deployment liqo-metric-agent -n "${NAMESPACE}" --type=json \
-        -p='[{"op":"replace","path":"/spec/template/spec/initContainers/0/image","value":"ghcr.io/liqotech/cert-creator:'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "    Warning: Could not patch init container"
+        -p='[{"op":"replace","path":"/spec/template/spec/initContainers/0/image","value":"'"${IMAGE_REGISTRY}"'/cert-creator:'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "    Warning: Could not patch init container"
     fi
     
     # Update labels
@@ -363,7 +364,7 @@ if [ "$ROLLBACK_CORE" = "true" ]; then
     
     # Update image
     kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
-      -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/image","value":"ghcr.io/liqotech/telemetry:'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "  Warning: Could not patch image"
+      -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/image","value":"'"${IMAGE_REGISTRY}"'/telemetry:'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "  Warning: Could not patch image"
     
     # Update --liqo-version arg (find index first)
     for i in 0 1 2 3 4 5; do
@@ -542,7 +543,7 @@ if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/de
   
   kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
     --type='json' -p='[
-      {"op": "replace", "path": "/spec/containerImage", "value": "ghcr.io/liqotech/virtual-kubelet:'"${PREVIOUS_VERSION}"'"}
+      {"op": "replace", "path": "/spec/containerImage", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${PREVIOUS_VERSION}"'"}
     ]' && echo "  ✓ VkOptionsTemplate reverted" || echo "  ⚠️ Warning: Could not revert VkOptionsTemplate"
 else
   echo "  ℹ️ VkOptionsTemplate not found, skipping"
@@ -569,7 +570,7 @@ if [ -n "$VIRTUALNODES" ]; then
       
       kubectl patch virtualnode "$VN_NAME" -n "$VN_NAMESPACE" \
         --type='json' -p='[
-          {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "ghcr.io/liqotech/virtual-kubelet:'"${PREVIOUS_VERSION}"'"}
+          {"op": "replace", "path": "/spec/template/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${PREVIOUS_VERSION}"'"}
         ]' 2>/dev/null && {
           echo "    ✓ VirtualNode image reverted"
           VN_COUNT=$((VN_COUNT + 1))
@@ -691,7 +692,7 @@ echo "  - VkOptionsTemplate: true"
 echo "  - VirtualNodes: true"
 echo "  - Cleanup annotations: true"
 `, upgrade.Status.PreviousVersion, upgrade.Status.Phase, upgrade.Status.PreviousVersion,
-		upgrade.Status.PreviousVersion, namespace, failedPhase)
+		upgrade.Status.PreviousVersion, namespace, failedPhase, upgrade.Spec.GetImageRegistry())
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

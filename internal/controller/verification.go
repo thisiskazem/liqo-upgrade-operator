@@ -41,7 +41,7 @@ func (r *LiqoUpgradeReconciler) performVerification(ctx context.Context, upgrade
 
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
-		namespace = "liqo"
+		namespace = defaultLiqoNamespace
 	}
 
 	// Verify all components are healthy

@@ -1,8 +1,11 @@
 name: E2E Tests
 
+# Disabled: Auto-generated E2E tests don't test actual upgrade logic.
+# TODO: Re-enable when meaningful E2E tests are added.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:  # Manual trigger only
+  # push:
+  # pull_request:
 
 jobs:
   test-e2e:

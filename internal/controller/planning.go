@@ -32,6 +32,17 @@ import (
 	upgradev1alpha1 "github.com/thisiskazem/liqo-upgrade-controller/api/v1alpha1"
 )
 
+// Constants for environment variable source types
+const (
+	envSourceValue    = "value"
+	envSourceFieldRef = "fieldRef"
+)
+
+// Component name constants
+const (
+	virtualKubeletPrefix = "liqo-virtual-kubelet"
+)
+
 // UpgradePlan represents the computed upgrade plan comparing snapshot vs descriptor
 type UpgradePlan struct {
 	Version  string             `json:"version"`
@@ -72,7 +83,7 @@ type FlagChange struct {
 
 // buildUpgradePlan compares snapshot (current state) with target descriptor (desired state)
 // and generates a plan of what needs to be created, updated, or deleted
-func (r *LiqoUpgradeReconciler) buildUpgradePlan(ctx context.Context, snapshot *ClusterSnapshot, descriptor *TargetDescriptor) (*UpgradePlan, error) {
+func (r *LiqoUpgradeReconciler) buildUpgradePlan(ctx context.Context, snapshot *ClusterSnapshot, descriptor *TargetDescriptor) *UpgradePlan {
 	logger := log.FromContext(ctx)
 	logger.Info("Building upgrade plan", "currentVersion", snapshot.Version, "targetVersion", descriptor.Version)
 
@@ -149,7 +160,7 @@ func (r *LiqoUpgradeReconciler) buildUpgradePlan(ctx context.Context, snapshot *
 	}
 
 	logger.Info("Upgrade plan built", "toCreate", len(plan.ToCreate), "toUpdate", len(plan.ToUpdate), "toDelete", len(plan.ToDelete))
-	return plan, nil
+	return plan
 }
 
 // compareComponent compares a current component with its target descriptor
@@ -166,12 +177,8 @@ func (r *LiqoUpgradeReconciler) compareComponent(current *ComponentSnapshot, tar
 		FlagChanges:   []FlagChange{},
 	}
 
-	hasChanges := false
-
 	// 1. Compare images
-	if current.Image != planned.TargetImage {
-		hasChanges = true
-	}
+	hasChanges := current.Image != planned.TargetImage
 
 	// 2. Compare environment variables
 	envChanges := r.compareEnvVars(current.Env, target.Env)
@@ -259,7 +266,7 @@ func (r *LiqoUpgradeReconciler) compareEnvVars(currentEnv []corev1.EnvVar, targe
 // formatCurrentEnvValue formats a Kubernetes EnvVar for comparison
 func (r *LiqoUpgradeReconciler) formatCurrentEnvValue(env corev1.EnvVar) (string, string) {
 	if env.Value != "" {
-		return env.Value, "value"
+		return env.Value, envSourceValue
 	}
 	if env.ValueFrom != nil {
 		if env.ValueFrom.ConfigMapKeyRef != nil {
@@ -271,7 +278,7 @@ func (r *LiqoUpgradeReconciler) formatCurrentEnvValue(env corev1.EnvVar) (string
 				fmt.Sprintf("secret:%s", env.ValueFrom.SecretKeyRef.Name)
 		}
 		if env.ValueFrom.FieldRef != nil {
-			return env.ValueFrom.FieldRef.FieldPath, "fieldRef"
+			return env.ValueFrom.FieldRef.FieldPath, envSourceFieldRef
 		}
 	}
 	return "", "unknown"
@@ -280,13 +287,13 @@ func (r *LiqoUpgradeReconciler) formatCurrentEnvValue(env corev1.EnvVar) (string
 // formatTargetEnvValue formats a TargetEnvVar for comparison
 func (r *LiqoUpgradeReconciler) formatTargetEnvValue(env TargetEnvVar) string {
 	switch env.Type {
-	case "value":
+	case envSourceValue:
 		return env.Value
 	case "configMapKeyRef":
 		return env.Key
 	case "secretKeyRef":
 		return env.Key
-	case "fieldRef":
+	case envSourceFieldRef:
 		return env.Value
 	default:
 		return ""
@@ -296,14 +303,14 @@ func (r *LiqoUpgradeReconciler) formatTargetEnvValue(env TargetEnvVar) string {
 // formatTargetEnvSource formats the source type for a TargetEnvVar
 func (r *LiqoUpgradeReconciler) formatTargetEnvSource(env TargetEnvVar) string {
 	switch env.Type {
-	case "value":
-		return "value"
+	case envSourceValue:
+		return envSourceValue
 	case "configMapKeyRef":
 		return fmt.Sprintf("configMap:%s", env.ConfigMapName)
 	case "secretKeyRef":
 		return fmt.Sprintf("secret:%s", env.SecretName)
-	case "fieldRef":
-		return "fieldRef"
+	case envSourceFieldRef:
+		return envSourceFieldRef
 	default:
 		return "unknown"
 	}
@@ -392,10 +399,7 @@ func parseArgs(args []string) map[string]string {
 // isDynamicComponent checks if a component is dynamic (virtual-kubelet, tenant gateway)
 func (r *LiqoUpgradeReconciler) isDynamicComponent(comp *ComponentSnapshot) bool {
 	// Virtual kubelet patterns
-	if len(comp.Name) > 20 && comp.Name[:20] == "liqo-virtual-kubelet" {
-		return true
-	}
-	if comp.Name == "liqo-virtual-kubelet" {
+	if len(comp.Name) >= len(virtualKubeletPrefix) && comp.Name[:len(virtualKubeletPrefix)] == virtualKubeletPrefix {
 		return true
 	}
 

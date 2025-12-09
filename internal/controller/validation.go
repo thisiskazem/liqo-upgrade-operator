@@ -56,7 +56,7 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
-		namespace = "liqo"
+		namespace = defaultLiqoNamespace
 	}
 
 	// Step 1: Verify cluster identity
@@ -128,10 +128,7 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 
 	// Step 8: Create live inventory and snapshot
 	logger.Info("Step 8: Creating live inventory snapshot")
-	snapshot, err := r.createLiveInventory(ctx, namespace, localVersion)
-	if err != nil {
-		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create live inventory: %v", err))
-	}
+	snapshot := r.createLiveInventory(ctx, namespace, localVersion)
 
 	if err := r.createSnapshotConfigMap(ctx, upgrade, snapshot, namespace); err != nil {
 		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create snapshot ConfigMap: %v", err))
@@ -139,15 +136,29 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 
 	// Step 9: Build upgrade plan (compare snapshot vs target descriptor)
 	logger.Info("Step 9: Building upgrade plan")
-	plan, err := r.buildUpgradePlan(ctx, snapshot, targetDescriptor)
-	if err != nil {
-		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to build upgrade plan: %v", err))
-	}
+	plan := r.buildUpgradePlan(ctx, snapshot, targetDescriptor)
 
 	if err := r.createUpgradePlanConfigMap(ctx, upgrade, plan, namespace); err != nil {
 		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to create upgrade plan ConfigMap: %v", err))
 	}
 	logger.Info("Upgrade plan created", "toCreate", len(plan.ToCreate), "toUpdate", len(plan.ToUpdate), "toDelete", len(plan.ToDelete))
+
+	// DryRun mode: Stop here after validation and plan generation
+	if upgrade.Spec.DryRun {
+		logger.Info("DryRun mode enabled - stopping after plan generation")
+		upgrade.Status.PreviousVersion = localVersion
+		upgrade.Status.Conditions = []metav1.Condition{{
+			Type:               string(upgradev1alpha1.ConditionCompatible),
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "DryRunComplete",
+			Message: fmt.Sprintf("DryRun: %s → %s validated. Plan: %d to update, %d to create, %d to delete",
+				localVersion, upgrade.Spec.TargetVersion, len(plan.ToUpdate), len(plan.ToCreate), len(plan.ToDelete)),
+		}}
+		return r.updateStatus(ctx, upgrade, upgradev1alpha1.PhaseCompleted,
+			fmt.Sprintf("DryRun complete: %d to update, %d to create, %d to delete. See ConfigMap %s for details.",
+				len(plan.ToUpdate), len(plan.ToCreate), len(plan.ToDelete), upgrade.Status.PlanConfigMap), nil)
+	}
 
 	// Step 10: Update status fields with validation results
 	// These must be persisted before transitioning to the next phase
@@ -459,10 +470,10 @@ func (r *LiqoUpgradeReconciler) compareVersions(v1, v2 string) int {
 	for i := 0; i < maxLen; i++ {
 		var p1, p2 int
 		if i < len(parts1) {
-			fmt.Sscanf(parts1[i], "%d", &p1)
+			_, _ = fmt.Sscanf(parts1[i], "%d", &p1)
 		}
 		if i < len(parts2) {
-			fmt.Sscanf(parts2[i], "%d", &p2)
+			_, _ = fmt.Sscanf(parts2[i], "%d", &p2)
 		}
 
 		if p1 < p2 {

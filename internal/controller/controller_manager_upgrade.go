@@ -113,7 +113,7 @@ func (r *LiqoUpgradeReconciler) buildControllerManagerUpgradeJob(upgrade *upgrad
 	jobName := fmt.Sprintf("%s-%s", controllerManagerUpgradePrefix, upgrade.Name)
 	namespace := upgrade.Spec.Namespace
 	if namespace == "" {
-		namespace = "liqo"
+		namespace = defaultLiqoNamespace
 	}
 
 	planConfigMap := upgrade.Status.PlanConfigMap
@@ -144,6 +144,7 @@ echo ""
 TARGET_VERSION="%s"
 NAMESPACE="%s"
 PLAN_CONFIGMAP="%s"
+IMAGE_REGISTRY="%s"
 
 # Load upgrade plan
 echo "Loading upgrade plan from ConfigMap ${PLAN_CONFIGMAP}..."
@@ -292,7 +293,6 @@ else
   echo "No crashlooping pods found"
 fi
 
-echo ""
 
 # Core control-plane components to upgrade (in order)
 CORE_COMPONENTS=("liqo-controller-manager" "liqo-crd-replicator" "liqo-metric-agent")
@@ -300,10 +300,12 @@ CORE_COMPONENTS=("liqo-controller-manager" "liqo-crd-replicator" "liqo-metric-ag
 # Function to upgrade a component using the plan
 upgrade_component() {
   local COMPONENT_NAME=$1
-
+  
+  echo ""
   echo "========================================="
   echo "Upgrading: ${COMPONENT_NAME}"
   echo "========================================="
+  echo ""
 
   # Check if component exists
   if ! kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" > /dev/null 2>&1; then
@@ -321,7 +323,7 @@ upgrade_component() {
     echo "⚠️  No update plan for ${COMPONENT_NAME}, using default image update only"
 
     # Fallback: simple image update
-    NEW_IMAGE="ghcr.io/liqotech/${COMPONENT_NAME}:${TARGET_VERSION}"
+    NEW_IMAGE="${IMAGE_REGISTRY}/${COMPONENT_NAME}:${TARGET_VERSION}"
     echo "Updating image to: ${NEW_IMAGE}"
 
     kubectl set image deployment/"${COMPONENT_NAME}" \
@@ -337,20 +339,20 @@ upgrade_component() {
     echo "  Target image: ${TARGET_IMAGE}"
     echo "  Container name: ${CONTAINER_NAME}"
 
-    # Step 1: Update image
+    # Update image
     echo ""
-    echo "Step 1: Updating container image..."
+    echo "Updating container image..."
     kubectl set image deployment/"${COMPONENT_NAME}" \
       "${CONTAINER_NAME}"="${TARGET_IMAGE}" \
       -n "${NAMESPACE}"
 
-    # Step 2: Apply environment variable changes
+    # Apply environment variable changes
     ENV_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.envChanges // []')
     ENV_COUNT=$(echo "$ENV_CHANGES" | jq 'length')
 
     if [ "$ENV_COUNT" -gt 0 ]; then
       echo ""
-      echo "Step 2: Applying ${ENV_COUNT} environment variable change(s)..."
+      echo "Applying ${ENV_COUNT} environment variable change(s)..."
 
       # Get current env array
       CURRENT_ENV=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" -o json | \
@@ -432,16 +434,16 @@ EOF
       fi
     else
       echo ""
-      echo "Step 2: No environment variable changes needed"
+      echo "No environment variable changes needed"
     fi
 
-    # Step 3: Apply command-line flag changes (via args)
+    # Apply command-line flag changes (via args)
     FLAG_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.flagChanges // []')
     FLAG_COUNT=$(echo "$FLAG_CHANGES" | jq 'length')
 
     if [ "$FLAG_COUNT" -gt 0 ]; then
       echo ""
-      echo "Step 3: Applying ${FLAG_COUNT} command-line flag change(s)..."
+      echo "Applying ${FLAG_COUNT} command-line flag change(s)..."
 
       # Get current args
       CURRENT_ARGS=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
@@ -489,13 +491,13 @@ EOF
         --type=strategic --patch "$ARGS_PATCH"
     else
       echo ""
-      echo "Step 3: No command-line flag changes needed"
+      echo "No command-line flag changes needed"
     fi
   fi
 
   # Ensure proper rolling update strategy
   echo ""
-  echo "Step 4: Ensuring proper rolling update strategy..."
+  echo "Ensuring proper rolling update strategy..."
 
   MAX_UNAVAILABLE=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
     -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}' 2>/dev/null || echo "0")
@@ -513,7 +515,7 @@ EOF
 
   # Wait for rollout
   echo ""
-  echo "Step 5: Waiting for rollout to complete..."
+  echo "Waiting for rollout to complete..."
   if ! kubectl rollout status deployment/"${COMPONENT_NAME}" -n "${NAMESPACE}" --timeout=5m; then
     echo "❌ ERROR: Rollout failed for ${COMPONENT_NAME}!"
     return 1
@@ -521,7 +523,7 @@ EOF
 
   # Verify health
   echo ""
-  echo "Step 6: Verifying deployment health..."
+  echo "Verifying deployment health..."
   if ! kubectl wait --for=condition=available --timeout=2m deployment/"${COMPONENT_NAME}" -n "${NAMESPACE}"; then
     echo "❌ ERROR: Deployment ${COMPONENT_NAME} not healthy!"
     return 1
@@ -529,14 +531,14 @@ EOF
 
   # Verify version
   echo ""
-  echo "Step 7: Verifying deployed version..."
+  echo "Verifying deployed version..."
   DEPLOYED_IMAGE=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
     -o jsonpath="{.spec.template.spec.containers[0].image}")
   echo "  Deployed image: ${DEPLOYED_IMAGE}"
 
   # Check for crashloops
   echo ""
-  echo "Step 8: Checking for crashloops..."
+  echo "Checking for crashloops..."
   sleep 10  # Wait a bit for pods to potentially crash
 
   RESTART_COUNT=$(kubectl get pods -n "${NAMESPACE}" -l "app.kubernetes.io/name=${COMPONENT_NAME}" \
@@ -597,6 +599,7 @@ echo ""
 echo "========================================="
 echo "Upgrading: liqo-metric-agent init container (cert-creator)"
 echo "========================================="
+echo ""
 
 if kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" > /dev/null 2>&1; then
   # Check if init container exists
@@ -610,7 +613,7 @@ if kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" > /dev/null 2>&1; 
       -o jsonpath='{.spec.template.spec.initContainers[0].image}' 2>/dev/null || echo "")
     echo "Current init container image: ${CURRENT_INIT_IMAGE}"
     
-    NEW_INIT_IMAGE="ghcr.io/liqotech/cert-creator:${TARGET_VERSION}"
+    NEW_INIT_IMAGE="${IMAGE_REGISTRY}/cert-creator:${TARGET_VERSION}"
     echo "Target init container image: ${NEW_INIT_IMAGE}"
     
     # Patch init container image
@@ -637,13 +640,15 @@ else
   echo "ℹ️  liqo-metric-agent not found, skipping init container upgrade"
 fi
 
+echo ""
 echo "========================================="
 echo "Upgrading: liqo-webhook (with TLS validation)"
 echo "========================================="
+echo ""
 
 # Check if webhook exists
 if kubectl get deployment liqo-webhook -n "${NAMESPACE}" > /dev/null 2>&1; then
-  echo "Step 1: Validating TLS certificates..."
+  echo "Validating TLS certificates..."
 
   # Check webhook secret
   WEBHOOK_SECRET=$(kubectl get deployment liqo-webhook -n "${NAMESPACE}" \
@@ -665,7 +670,7 @@ if kubectl get deployment liqo-webhook -n "${NAMESPACE}" > /dev/null 2>&1; then
   fi
 
   echo ""
-  echo "Step 2: Upgrading webhook deployment..."
+  echo "Upgrading webhook deployment..."
 
   # Upgrade webhook component (reuse function)
   if ! upgrade_component "liqo-webhook"; then
@@ -674,7 +679,7 @@ if kubectl get deployment liqo-webhook -n "${NAMESPACE}" > /dev/null 2>&1; then
   fi
 
   echo ""
-  echo "Step 3: Verifying webhook configurations..."
+  echo "Verifying webhook configurations..."
 
   # Check MutatingWebhookConfiguration
   if kubectl get mutatingwebhookconfiguration | grep -q liqo; then
@@ -695,7 +700,7 @@ if kubectl get deployment liqo-webhook -n "${NAMESPACE}" > /dev/null 2>&1; then
   fi
 
   echo ""
-  echo "Step 4: Testing webhook admission..."
+  echo "Testing webhook admission..."
   # Give webhook a moment to be ready
   sleep 5
 
@@ -716,9 +721,9 @@ echo ""
 echo "========================================="
 echo "Upgrading: liqo-telemetry (CronJob)"
 echo "========================================="
+echo ""
 
 TELEMETRY_EXISTS=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" --ignore-not-found -o name)
-echo "DEBUG: TELEMETRY_EXISTS=${TELEMETRY_EXISTS}"
 
 if [ -n "${TELEMETRY_EXISTS}" ]; then
   echo "Found liqo-telemetry CronJob"
@@ -727,16 +732,15 @@ if [ -n "${TELEMETRY_EXISTS}" ]; then
     -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}')
   echo "Current image: ${CURRENT_TELEMETRY_IMAGE}"
   
-  NEW_TELEMETRY_IMAGE="ghcr.io/liqotech/telemetry:${TARGET_VERSION}"
+  NEW_TELEMETRY_IMAGE="${IMAGE_REGISTRY}/telemetry:${TARGET_VERSION}"
   echo "Target image: ${NEW_TELEMETRY_IMAGE}"
   
-  # Step 1: Update image using JSON patch
-  echo "Step 1: Updating container image with JSON patch..."
+  # Update image using JSON patch
+  echo "Updating container image with JSON patch..."
   
   kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type='json' \
     -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/image","value":"'"${NEW_TELEMETRY_IMAGE}"'"}]'
   PATCH_RESULT=$?
-  echo "DEBUG: Image patch exit code: ${PATCH_RESULT}"
   
   if [ ${PATCH_RESULT} -ne 0 ]; then
     echo "  ❌ ERROR: Failed to patch CronJob image"
@@ -745,8 +749,8 @@ if [ -n "${TELEMETRY_EXISTS}" ]; then
     echo "  ✓ Image patch command succeeded"
   fi
   
-  # Step 2: Update --liqo-version arg
-  echo "Step 2: Updating --liqo-version arg..."
+  # Update --liqo-version arg
+  echo "Updating --liqo-version arg..."
   
   # Get current args and find the index of --liqo-version
   CURRENT_ARGS=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
@@ -768,7 +772,6 @@ if [ -n "${TELEMETRY_EXISTS}" ]; then
   kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type='json' \
     -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/args/'"${ARG_INDEX}"'","value":"--liqo-version='"${TARGET_VERSION}"'"}]'
   ARGS_RESULT=$?
-  echo "DEBUG: Args patch exit code: ${ARGS_RESULT}"
   
   if [ ${ARGS_RESULT} -ne 0 ]; then
     echo "  ⚠️  WARNING: Failed to patch --liqo-version arg"
@@ -803,9 +806,9 @@ if [ -n "${TELEMETRY_EXISTS}" ]; then
     echo "⚠️  WARNING: --liqo-version arg may not have been updated"
   fi
   
-  # Step 3: Update version labels for CronJob
+  # Update version labels for CronJob
   echo ""
-  echo "Step 3: Updating version labels..."
+  echo "Updating version labels..."
   
   # Update metadata labels
   kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
@@ -831,6 +834,7 @@ echo ""
 echo "========================================="
 echo "Fixing: liqo-telemetry RBAC (Known Liqo Bug)"
 echo "========================================="
+echo ""
 echo "The liqo-telemetry ClusterRole is missing create/update permissions for configmaps."
 echo "This is a bug in Liqo's Helm chart that we fix during upgrade."
 
@@ -859,7 +863,6 @@ echo ""
 echo "========================================="
 echo "Post-Upgrade Health Checks"
 echo "========================================="
-
 echo ""
 echo "Checking all control-plane deployments..."
 ALL_HEALTHY=true
@@ -923,7 +926,7 @@ echo "  - liqo-metric-agent: upgraded (including cert-creator init container)"
 echo "  - liqo-webhook: upgraded with TLS validation"
 echo "  - liqo-telemetry: CronJob upgraded"
 echo "  - Post-rollout health: verified"
-`, upgrade.Spec.TargetVersion, namespace, planConfigMap)
+`, upgrade.Spec.TargetVersion, namespace, planConfigMap, upgrade.Spec.GetImageRegistry())
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

@@ -27,12 +27,25 @@ const (
 	StrategyParallel   UpgradeStrategy = "Parallel"
 )
 
+// DefaultImageRegistry is the default container registry for Liqo images
+const DefaultImageRegistry = "ghcr.io/liqotech"
+
 type LiqoUpgradeSpec struct {
 	TargetVersion string           `json:"targetVersion"`
 	Namespace     string           `json:"namespace,omitempty"`
 	AutoRollback  *bool            `json:"autoRollback,omitempty"`
 	Strategy      *UpgradeStrategy `json:"strategy,omitempty"`
 	DryRun        bool             `json:"dryRun,omitempty"`
+	// ImageRegistry is the container registry for Liqo images (default: ghcr.io/liqotech)
+	ImageRegistry string `json:"imageRegistry,omitempty"`
+}
+
+// GetImageRegistry returns the image registry, defaulting to ghcr.io/liqotech if not specified
+func (s *LiqoUpgradeSpec) GetImageRegistry() string {
+	if s.ImageRegistry == "" {
+		return DefaultImageRegistry
+	}
+	return s.ImageRegistry
 }
 
 type UpgradePhase string

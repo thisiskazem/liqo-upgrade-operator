@@ -112,7 +112,7 @@ var liqoComponents = []struct {
 }
 
 // createLiveInventory builds a full snapshot of the current Liqo installation
-func (r *LiqoUpgradeReconciler) createLiveInventory(ctx context.Context, namespace string, currentVersion string) (*ClusterSnapshot, error) {
+func (r *LiqoUpgradeReconciler) createLiveInventory(ctx context.Context, namespace string, currentVersion string) *ClusterSnapshot {
 	logger := log.FromContext(ctx)
 	logger.Info("Creating live inventory of Liqo installation")
 
@@ -162,7 +162,7 @@ func (r *LiqoUpgradeReconciler) createLiveInventory(ctx context.Context, namespa
 	}
 
 	logger.Info("Live inventory complete", "components", len(snapshot.Components), "crds", len(snapshot.CRDs))
-	return snapshot, nil
+	return snapshot
 }
 
 // inventoryComponent creates a snapshot of a single component
