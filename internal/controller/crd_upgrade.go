@@ -409,7 +409,7 @@ echo "  - Existing objects: ${TOTAL_OBJECTS}"
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: int32Ptr(300),
+			TTLSecondsAfterFinished: int32Ptr(1800),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "liqo-upgrade-controller",

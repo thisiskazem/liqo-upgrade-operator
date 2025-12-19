@@ -128,6 +128,192 @@ PREVIOUS_VERSION="%s"
 NAMESPACE="%s"
 FAILED_PHASE="%s"
 IMAGE_REGISTRY="%s"
+TARGET_DESCRIPTOR_FILE="/etc/liqo-target-descriptors/${PREVIOUS_VERSION}.json"
+
+# Load target descriptor for previous version
+if [ -f "$TARGET_DESCRIPTOR_FILE" ]; then
+  echo "Loading target descriptor for ${PREVIOUS_VERSION}..."
+  TARGET_DESCRIPTOR=$(cat "$TARGET_DESCRIPTOR_FILE")
+  echo "  ✓ Target descriptor loaded"
+else
+  echo "⚠️ WARNING: Target descriptor not found at $TARGET_DESCRIPTOR_FILE"
+  echo "  Rollback will only restore images, not env vars or args"
+  TARGET_DESCRIPTOR=""
+fi
+
+#############################################
+# HELPER FUNCTIONS FOR ENV/ARGS RESTORATION
+#############################################
+
+# Function to get component info from target descriptor
+get_component_info() {
+  local COMPONENT_NAME="$1"
+  if [ -n "$TARGET_DESCRIPTOR" ]; then
+    echo "$TARGET_DESCRIPTOR" | jq -c ".components[] | select(.name==\"$COMPONENT_NAME\")" 2>/dev/null || echo ""
+  else
+    echo ""
+  fi
+}
+
+# Function to restore args for a deployment
+restore_deployment_args() {
+  local COMPONENT_NAME="$1"
+  local RESOURCE_KIND="$2"  # deployment or daemonset
+  
+  local COMPONENT_INFO=$(get_component_info "$COMPONENT_NAME")
+  if [ -z "$COMPONENT_INFO" ]; then
+    echo "    ℹ️ No descriptor info for $COMPONENT_NAME, skipping args restore"
+    return 0
+  fi
+  
+  local CONTAINER_NAME=$(echo "$COMPONENT_INFO" | jq -r '.containerName')
+  local TARGET_ARGS=$(echo "$COMPONENT_INFO" | jq -c '.args // []')
+  
+  if [ "$TARGET_ARGS" != "[]" ] && [ "$TARGET_ARGS" != "null" ]; then
+    echo "    Restoring args for $COMPONENT_NAME (container: $CONTAINER_NAME)..."
+    
+    # Find container index
+    local CONTAINER_INDEX=0
+    if [ "$RESOURCE_KIND" = "deployment" ]; then
+      CONTAINER_INDEX=$(kubectl get deployment "$COMPONENT_NAME" -n "${NAMESPACE}" \
+        -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -n "^${CONTAINER_NAME}$" | cut -d: -f1 || echo "1")
+      CONTAINER_INDEX=$((CONTAINER_INDEX - 1))
+      [ "$CONTAINER_INDEX" -lt 0 ] && CONTAINER_INDEX=0
+      
+      kubectl patch deployment "$COMPONENT_NAME" -n "${NAMESPACE}" --type=json \
+        -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${CONTAINER_INDEX}/args\",\"value\":${TARGET_ARGS}}]" 2>/dev/null \
+        && echo "      ✓ Args restored" \
+        || echo "      ⚠️ Could not restore args"
+    elif [ "$RESOURCE_KIND" = "daemonset" ]; then
+      CONTAINER_INDEX=$(kubectl get daemonset "$COMPONENT_NAME" -n "${NAMESPACE}" \
+        -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -n "^${CONTAINER_NAME}$" | cut -d: -f1 || echo "1")
+      CONTAINER_INDEX=$((CONTAINER_INDEX - 1))
+      [ "$CONTAINER_INDEX" -lt 0 ] && CONTAINER_INDEX=0
+      
+      kubectl patch daemonset "$COMPONENT_NAME" -n "${NAMESPACE}" --type=json \
+        -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${CONTAINER_INDEX}/args\",\"value\":${TARGET_ARGS}}]" 2>/dev/null \
+        && echo "      ✓ Args restored" \
+        || echo "      ⚠️ Could not restore args"
+    fi
+  else
+    echo "    ℹ️ No args changes for $COMPONENT_NAME"
+  fi
+}
+
+# Function to restore env vars for a deployment
+restore_deployment_env() {
+  local COMPONENT_NAME="$1"
+  local RESOURCE_KIND="$2"  # deployment or daemonset
+  
+  local COMPONENT_INFO=$(get_component_info "$COMPONENT_NAME")
+  if [ -z "$COMPONENT_INFO" ]; then
+    echo "    ℹ️ No descriptor info for $COMPONENT_NAME, skipping env restore"
+    return 0
+  fi
+  
+  local CONTAINER_NAME=$(echo "$COMPONENT_INFO" | jq -r '.containerName')
+  local TARGET_ENV=$(echo "$COMPONENT_INFO" | jq -c '.env // []')
+  
+  if [ "$TARGET_ENV" != "[]" ] && [ "$TARGET_ENV" != "null" ]; then
+    echo "    Restoring env vars for $COMPONENT_NAME..."
+    
+    # Convert our env format to Kubernetes env format
+    local K8S_ENV=$(echo "$TARGET_ENV" | jq -c '[.[] | 
+      if .type == "value" then
+        {name: .name, value: .value}
+      elif .type == "fieldRef" then
+        {name: .name, valueFrom: {fieldRef: {fieldPath: .value}}}
+      elif .type == "configMapKeyRef" then
+        {name: .name, valueFrom: {configMapKeyRef: {name: .configMapName, key: .key}}}
+      elif .type == "secretKeyRef" then
+        {name: .name, valueFrom: {secretKeyRef: {name: .secretName, key: .key}}}
+      else
+        {name: .name, value: .value}
+      end
+    ]')
+    
+    # Find container index
+    local CONTAINER_INDEX=0
+    if [ "$RESOURCE_KIND" = "deployment" ]; then
+      CONTAINER_INDEX=$(kubectl get deployment "$COMPONENT_NAME" -n "${NAMESPACE}" \
+        -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -n "^${CONTAINER_NAME}$" | cut -d: -f1 || echo "1")
+      CONTAINER_INDEX=$((CONTAINER_INDEX - 1))
+      [ "$CONTAINER_INDEX" -lt 0 ] && CONTAINER_INDEX=0
+      
+      kubectl patch deployment "$COMPONENT_NAME" -n "${NAMESPACE}" --type=json \
+        -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${CONTAINER_INDEX}/env\",\"value\":${K8S_ENV}}]" 2>/dev/null \
+        && echo "      ✓ Env vars restored" \
+        || echo "      ⚠️ Could not restore env vars"
+    elif [ "$RESOURCE_KIND" = "daemonset" ]; then
+      CONTAINER_INDEX=$(kubectl get daemonset "$COMPONENT_NAME" -n "${NAMESPACE}" \
+        -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -n "^${CONTAINER_NAME}$" | cut -d: -f1 || echo "1")
+      CONTAINER_INDEX=$((CONTAINER_INDEX - 1))
+      [ "$CONTAINER_INDEX" -lt 0 ] && CONTAINER_INDEX=0
+      
+      kubectl patch daemonset "$COMPONENT_NAME" -n "${NAMESPACE}" --type=json \
+        -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${CONTAINER_INDEX}/env\",\"value\":${K8S_ENV}}]" 2>/dev/null \
+        && echo "      ✓ Env vars restored" \
+        || echo "      ⚠️ Could not restore env vars"
+    fi
+  else
+    echo "    ℹ️ No env var changes for $COMPONENT_NAME"
+  fi
+}
+
+# Function to restore command for a deployment/daemonset
+restore_deployment_command() {
+  local COMPONENT_NAME="$1"
+  local RESOURCE_KIND="$2"  # deployment or daemonset
+  
+  local COMPONENT_INFO=$(get_component_info "$COMPONENT_NAME")
+  if [ -z "$COMPONENT_INFO" ]; then
+    echo "    ℹ️ No descriptor info for $COMPONENT_NAME, skipping command restore"
+    return 0
+  fi
+  
+  local CONTAINER_NAME=$(echo "$COMPONENT_INFO" | jq -r '.containerName')
+  local TARGET_COMMAND=$(echo "$COMPONENT_INFO" | jq -c '.command // []')
+  
+  if [ "$TARGET_COMMAND" != "[]" ] && [ "$TARGET_COMMAND" != "null" ]; then
+    echo "    Restoring command for $COMPONENT_NAME (container: $CONTAINER_NAME)..."
+    
+    # Find container index
+    local CONTAINER_INDEX=0
+    if [ "$RESOURCE_KIND" = "deployment" ]; then
+      CONTAINER_INDEX=$(kubectl get deployment "$COMPONENT_NAME" -n "${NAMESPACE}" \
+        -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -n "^${CONTAINER_NAME}$" | cut -d: -f1 || echo "1")
+      CONTAINER_INDEX=$((CONTAINER_INDEX - 1))
+      [ "$CONTAINER_INDEX" -lt 0 ] && CONTAINER_INDEX=0
+      
+      kubectl patch deployment "$COMPONENT_NAME" -n "${NAMESPACE}" --type=json \
+        -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${CONTAINER_INDEX}/command\",\"value\":${TARGET_COMMAND}}]" 2>/dev/null \
+        && echo "      ✓ Command restored" \
+        || echo "      ⚠️ Could not restore command"
+    elif [ "$RESOURCE_KIND" = "daemonset" ]; then
+      CONTAINER_INDEX=$(kubectl get daemonset "$COMPONENT_NAME" -n "${NAMESPACE}" \
+        -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -n "^${CONTAINER_NAME}$" | cut -d: -f1 || echo "1")
+      CONTAINER_INDEX=$((CONTAINER_INDEX - 1))
+      [ "$CONTAINER_INDEX" -lt 0 ] && CONTAINER_INDEX=0
+      
+      kubectl patch daemonset "$COMPONENT_NAME" -n "${NAMESPACE}" --type=json \
+        -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/${CONTAINER_INDEX}/command\",\"value\":${TARGET_COMMAND}}]" 2>/dev/null \
+        && echo "      ✓ Command restored" \
+        || echo "      ⚠️ Could not restore command"
+    fi
+  else
+    echo "    ℹ️ No command changes for $COMPONENT_NAME"
+  fi
+}
+
+# Function to get template info from target descriptor
+get_template_info() {
+  local TEMPLATE_NAME="$1"
+  if [ -n "$TARGET_DESCRIPTOR" ]; then
+    echo "$TARGET_DESCRIPTOR" | jq -c ".templates[] | select(.name==\"$TEMPLATE_NAME\")" 2>/dev/null || echo ""
+  else
+    echo ""
+  fi
+}
 
 # Determine rollback scope based on failed phase
 # Cumulative rollback: always rollback from the failed phase down to CRDs
@@ -185,26 +371,122 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     WGGW_CLIENT_TEMPLATES=$(kubectl get wggatewayclienttemplate -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     for TEMPLATE in ${WGGW_CLIENT_TEMPLATES}; do
       echo "  Rolling back WgGatewayClientTemplate: ${TEMPLATE}"
+      
+      # Get template info from target descriptor
+      GW_CLIENT_TEMPLATE_INFO=$(get_template_info "wireguard-client")
+      
+      # Rollback images and labels
       kubectl patch wggatewayclienttemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' -p='[
         {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
-      ]' 2>/dev/null || echo "    Warning: Could not patch template"
+        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
+      ]' 2>/dev/null || echo "    Warning: Could not patch template images"
+      
+      # Restore args, env, and command for each container from target descriptor
+      if [ -n "$GW_CLIENT_TEMPLATE_INFO" ]; then
+        CONTAINER_COUNT=$(echo "$GW_CLIENT_TEMPLATE_INFO" | jq '.containers | length')
+        for i in $(seq 0 $((CONTAINER_COUNT - 1))); do
+          CONTAINER_NAME=$(echo "$GW_CLIENT_TEMPLATE_INFO" | jq -r ".containers[$i].name")
+          CONTAINER_ARGS=$(echo "$GW_CLIENT_TEMPLATE_INFO" | jq -c ".containers[$i].args // []")
+          CONTAINER_ENV=$(echo "$GW_CLIENT_TEMPLATE_INFO" | jq -c ".containers[$i].env // []")
+          CONTAINER_COMMAND=$(echo "$GW_CLIENT_TEMPLATE_INFO" | jq -c ".containers[$i].command // []")
+          
+          echo "    Restoring container $CONTAINER_NAME (index $i)..."
+          
+          # Restore args
+          if [ "$CONTAINER_ARGS" != "[]" ] && [ "$CONTAINER_ARGS" != "null" ]; then
+            kubectl patch wggatewayclienttemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' \
+              -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/deployment/spec/template/spec/containers/${i}/args\", \"value\": ${CONTAINER_ARGS}}]" 2>/dev/null \
+              && echo "      ✓ Args restored" || echo "      ⚠️ Could not restore args"
+          fi
+          
+          # Restore env (convert to K8s format)
+          if [ "$CONTAINER_ENV" != "[]" ] && [ "$CONTAINER_ENV" != "null" ]; then
+            K8S_ENV=$(echo "$CONTAINER_ENV" | jq -c '[.[] | 
+              if .type == "value" then {name: .name, value: .value}
+              elif .type == "fieldRef" then {name: .name, valueFrom: {fieldRef: {fieldPath: .value}}}
+              elif .type == "configMapKeyRef" then {name: .name, valueFrom: {configMapKeyRef: {name: .configMapName, key: .key}}}
+              else {name: .name, value: .value} end
+            ]')
+            kubectl patch wggatewayclienttemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' \
+              -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/deployment/spec/template/spec/containers/${i}/env\", \"value\": ${K8S_ENV}}]" 2>/dev/null \
+              && echo "      ✓ Env vars restored" || echo "      ⚠️ Could not restore env vars"
+          fi
+          
+          # Restore command
+          if [ "$CONTAINER_COMMAND" != "[]" ] && [ "$CONTAINER_COMMAND" != "null" ]; then
+            kubectl patch wggatewayclienttemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' \
+              -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/deployment/spec/template/spec/containers/${i}/command\", \"value\": ${CONTAINER_COMMAND}}]" 2>/dev/null \
+              && echo "      ✓ Command restored" || echo "      ⚠️ Could not restore command"
+          fi
+        done
+      fi
+      echo "    ✓ WgGatewayClientTemplate ${TEMPLATE} rolled back"
     done
 
     # Rollback WgGatewayServerTemplate resources
     WGGW_SERVER_TEMPLATES=$(kubectl get wggatewayservertemplate -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     for TEMPLATE in ${WGGW_SERVER_TEMPLATES}; do
       echo "  Rolling back WgGatewayServerTemplate: ${TEMPLATE}"
+      
+      # Get template info from target descriptor
+      GW_SERVER_TEMPLATE_INFO=$(get_template_info "wireguard-server")
+      
+      # Rollback images and labels
       kubectl patch wggatewayservertemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' -p='[
         {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${PREVIOUS_VERSION}"'"},
         {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
-        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
-      ]' 2>/dev/null || echo "    Warning: Could not patch template"
+        {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/app.kubernetes.io~1version", "value": "'"${PREVIOUS_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/helm.sh~1chart", "value": "liqo-'"${PREVIOUS_VERSION}"'"}
+      ]' 2>/dev/null || echo "    Warning: Could not patch template images"
+      
+      # Restore args, env, and command for each container from target descriptor
+      if [ -n "$GW_SERVER_TEMPLATE_INFO" ]; then
+        CONTAINER_COUNT=$(echo "$GW_SERVER_TEMPLATE_INFO" | jq '.containers | length')
+        for i in $(seq 0 $((CONTAINER_COUNT - 1))); do
+          CONTAINER_NAME=$(echo "$GW_SERVER_TEMPLATE_INFO" | jq -r ".containers[$i].name")
+          CONTAINER_ARGS=$(echo "$GW_SERVER_TEMPLATE_INFO" | jq -c ".containers[$i].args // []")
+          CONTAINER_ENV=$(echo "$GW_SERVER_TEMPLATE_INFO" | jq -c ".containers[$i].env // []")
+          CONTAINER_COMMAND=$(echo "$GW_SERVER_TEMPLATE_INFO" | jq -c ".containers[$i].command // []")
+          
+          echo "    Restoring container $CONTAINER_NAME (index $i)..."
+          
+          # Restore args
+          if [ "$CONTAINER_ARGS" != "[]" ] && [ "$CONTAINER_ARGS" != "null" ]; then
+            kubectl patch wggatewayservertemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' \
+              -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/deployment/spec/template/spec/containers/${i}/args\", \"value\": ${CONTAINER_ARGS}}]" 2>/dev/null \
+              && echo "      ✓ Args restored" || echo "      ⚠️ Could not restore args"
+          fi
+          
+          # Restore env (convert to K8s format)
+          if [ "$CONTAINER_ENV" != "[]" ] && [ "$CONTAINER_ENV" != "null" ]; then
+            K8S_ENV=$(echo "$CONTAINER_ENV" | jq -c '[.[] | 
+              if .type == "value" then {name: .name, value: .value}
+              elif .type == "fieldRef" then {name: .name, valueFrom: {fieldRef: {fieldPath: .value}}}
+              elif .type == "configMapKeyRef" then {name: .name, valueFrom: {configMapKeyRef: {name: .configMapName, key: .key}}}
+              else {name: .name, value: .value} end
+            ]')
+            kubectl patch wggatewayservertemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' \
+              -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/deployment/spec/template/spec/containers/${i}/env\", \"value\": ${K8S_ENV}}]" 2>/dev/null \
+              && echo "      ✓ Env vars restored" || echo "      ⚠️ Could not restore env vars"
+          fi
+          
+          # Restore command
+          if [ "$CONTAINER_COMMAND" != "[]" ] && [ "$CONTAINER_COMMAND" != "null" ]; then
+            kubectl patch wggatewayservertemplate "${TEMPLATE}" -n "${NAMESPACE}" --type='json' \
+              -p="[{\"op\": \"replace\", \"path\": \"/spec/template/spec/deployment/spec/template/spec/containers/${i}/command\", \"value\": ${CONTAINER_COMMAND}}]" 2>/dev/null \
+              && echo "      ✓ Command restored" || echo "      ⚠️ Could not restore command"
+          fi
+        done
+      fi
+      echo "    ✓ WgGatewayServerTemplate ${TEMPLATE} rolled back"
     done
 
     # Rollback wggatewayclient resources
@@ -242,6 +524,14 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
         wireguard=${IMAGE_REGISTRY}/gateway/wireguard:${PREVIOUS_VERSION} \
         geneve=${IMAGE_REGISTRY}/gateway/geneve:${PREVIOUS_VERSION} \
         -n "${TENANT_NS}" 2>/dev/null || echo "    Warning: Could not update deployment"
+      
+      # Rollback labels
+      kubectl patch deployment "${GW}" -n "${TENANT_NS}" --type=json \
+        -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+             {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"},
+             {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+             {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "    Warning: Could not rollback labels"
+      
       kubectl rollout status deployment/"${GW}" -n "${TENANT_NS}" --timeout=5m 2>/dev/null || echo "    Warning: Rollout did not complete"
     done
   done
@@ -255,9 +545,17 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     echo "Rolling back liqo-ipam..."
     CONTAINER_NAME=$(kubectl get deployment liqo-ipam -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
     kubectl set image deployment/liqo-ipam "${CONTAINER_NAME}=${IMAGE_REGISTRY}/ipam:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    
+    # Restore args, env, and command from target descriptor
+    restore_deployment_args "liqo-ipam" "deployment"
+    restore_deployment_env "liqo-ipam" "deployment"
+    restore_deployment_command "liqo-ipam" "deployment"
+    
     kubectl patch deployment liqo-ipam -n "${NAMESPACE}" --type=json \
       -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
-           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
     kubectl rollout status deployment/liqo-ipam -n "${NAMESPACE}" --timeout=3m
     echo "  ✓ liqo-ipam rolled back"
   fi
@@ -268,9 +566,17 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     echo "Rolling back liqo-proxy..."
     CONTAINER_NAME=$(kubectl get deployment liqo-proxy -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
     kubectl set image deployment/liqo-proxy "${CONTAINER_NAME}=${IMAGE_REGISTRY}/proxy:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    
+    # Restore args, env, and command from target descriptor
+    restore_deployment_args "liqo-proxy" "deployment"
+    restore_deployment_env "liqo-proxy" "deployment"
+    restore_deployment_command "liqo-proxy" "deployment"
+    
     kubectl patch deployment liqo-proxy -n "${NAMESPACE}" --type=json \
       -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
-           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
     kubectl rollout status deployment/liqo-proxy -n "${NAMESPACE}" --timeout=3m
     echo "  ✓ liqo-proxy rolled back"
   fi
@@ -281,9 +587,17 @@ if [ "$ROLLBACK_NETWORK" = "true" ]; then
     echo "Rolling back liqo-fabric..."
     CONTAINER_NAME=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
     kubectl set image daemonset/liqo-fabric "${CONTAINER_NAME}=${IMAGE_REGISTRY}/fabric:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    
+    # Restore args, env, and command from target descriptor
+    restore_deployment_args "liqo-fabric" "daemonset"
+    restore_deployment_env "liqo-fabric" "daemonset"
+    restore_deployment_command "liqo-fabric" "daemonset"
+    
     kubectl patch daemonset liqo-fabric -n "${NAMESPACE}" --type=json \
       -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
-           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+           {"op":"replace","path":"/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
+           {"op":"replace","path":"/spec/template/metadata/labels/helm.sh~1chart","value":"liqo-'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
     kubectl rollout status daemonset/liqo-fabric -n "${NAMESPACE}" --timeout=5m
     echo "  ✓ liqo-fabric rolled back"
   fi
@@ -312,6 +626,11 @@ if [ "$ROLLBACK_CORE" = "true" ]; then
       CONTAINER_NAME=$(kubectl get deployment "${COMPONENT}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
       kubectl set image deployment/"${COMPONENT}" "${CONTAINER_NAME}=${IMAGE_REGISTRY}/${IMAGE_NAME}:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
       
+      # Restore args, env, and command from target descriptor
+      restore_deployment_args "${COMPONENT}" "deployment"
+      restore_deployment_env "${COMPONENT}" "deployment"
+      restore_deployment_command "${COMPONENT}" "deployment"
+      
       # Update labels
       kubectl patch deployment "${COMPONENT}" -n "${NAMESPACE}" --type=json \
         -p='[{"op":"replace","path":"/metadata/labels/app.kubernetes.io~1version","value":"'"${PREVIOUS_VERSION}"'"},
@@ -337,6 +656,10 @@ if [ "$ROLLBACK_CORE" = "true" ]; then
     echo "Rolling back liqo-metric-agent..."
     CONTAINER_NAME=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
     kubectl set image deployment/liqo-metric-agent "${CONTAINER_NAME}=${IMAGE_REGISTRY}/metric-agent:${PREVIOUS_VERSION}" -n "${NAMESPACE}"
+    
+    # Restore args and env from target descriptor
+    restore_deployment_args "liqo-metric-agent" "deployment"
+    restore_deployment_env "liqo-metric-agent" "deployment"
     
     # Rollback init container (cert-creator)
     INIT_EXISTS=$(kubectl get deployment liqo-metric-agent -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.initContainers[0].name}' 2>/dev/null || echo "")
@@ -366,16 +689,29 @@ if [ "$ROLLBACK_CORE" = "true" ]; then
     kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
       -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/image","value":"'"${IMAGE_REGISTRY}"'/telemetry:'"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || echo "  Warning: Could not patch image"
     
-    # Update --liqo-version arg (find index first)
-    for i in 0 1 2 3 4 5; do
-      ARG_VAL=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
-        -o jsonpath="{.spec.jobTemplate.spec.template.spec.containers[0].args[${i}]}" 2>/dev/null || echo "")
-      if [[ "${ARG_VAL}" == --liqo-version=* ]]; then
+    # Restore full args from target descriptor
+    TELEMETRY_INFO=$(get_component_info "liqo-telemetry")
+    if [ -n "$TELEMETRY_INFO" ]; then
+      TELEMETRY_ARGS=$(echo "$TELEMETRY_INFO" | jq -c '.args // []')
+      if [ "$TELEMETRY_ARGS" != "[]" ] && [ "$TELEMETRY_ARGS" != "null" ]; then
+        echo "    Restoring liqo-telemetry args from target descriptor..."
         kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
-          -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/args/'"${i}"'","value":"--liqo-version='"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
-        break
+          -p="[{\"op\":\"replace\",\"path\":\"/spec/jobTemplate/spec/template/spec/containers/0/args\",\"value\":${TELEMETRY_ARGS}}]" 2>/dev/null \
+          && echo "      ✓ Args restored" \
+          || echo "      ⚠️ Could not restore args"
       fi
-    done
+    else
+      # Fallback: just update --liqo-version arg
+      for i in 0 1 2 3 4 5; do
+        ARG_VAL=$(kubectl get cronjob liqo-telemetry -n "${NAMESPACE}" \
+          -o jsonpath="{.spec.jobTemplate.spec.template.spec.containers[0].args[${i}]}" 2>/dev/null || echo "")
+        if [[ "${ARG_VAL}" == --liqo-version=* ]]; then
+          kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
+            -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/args/'"${i}"'","value":"--liqo-version='"${PREVIOUS_VERSION}"'"}]' 2>/dev/null || true
+          break
+        fi
+      done
+    fi
     
     # Update labels
     kubectl patch cronjob liqo-telemetry -n "${NAMESPACE}" --type=json \
@@ -541,10 +877,28 @@ echo "========================================="
 if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/dev/null; then
   echo "Reverting VkOptionsTemplate to version ${PREVIOUS_VERSION}..."
   
+  # Get template info from target descriptor
+  VK_TEMPLATE_INFO=$(get_template_info "virtual-kubelet-default")
+  
+  # Revert image
   kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
     --type='json' -p='[
       {"op": "replace", "path": "/spec/containerImage", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${PREVIOUS_VERSION}"'"}
-    ]' && echo "  ✓ VkOptionsTemplate reverted" || echo "  ⚠️ Warning: Could not revert VkOptionsTemplate"
+    ]' && echo "  ✓ VkOptionsTemplate image reverted" || echo "  ⚠️ Warning: Could not revert VkOptionsTemplate image"
+  
+  # Restore extraArgs from target descriptor
+  if [ -n "$VK_TEMPLATE_INFO" ]; then
+    VK_EXTRA_ARGS=$(echo "$VK_TEMPLATE_INFO" | jq -c '.containers[0].args // []')
+    if [ "$VK_EXTRA_ARGS" != "[]" ] && [ "$VK_EXTRA_ARGS" != "null" ]; then
+      echo "  Restoring VkOptionsTemplate extraArgs..."
+      kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+        --type='json' -p="[{\"op\": \"replace\", \"path\": \"/spec/extraArgs\", \"value\": ${VK_EXTRA_ARGS}}]" \
+        && echo "    ✓ extraArgs restored" \
+        || echo "    ⚠️ Could not restore extraArgs"
+    else
+      echo "  ℹ️ No extraArgs to restore"
+    fi
+  fi
 else
   echo "  ℹ️ VkOptionsTemplate not found, skipping"
 fi
@@ -704,7 +1058,7 @@ echo "  - Cleanup annotations: true"
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: int32Ptr(300),
+			TTLSecondsAfterFinished: int32Ptr(1800),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "liqo-upgrade-controller",
@@ -714,6 +1068,26 @@ echo "  - Cleanup annotations: true"
 							Name:    "rollback",
 							Image:   "bitnami/kubectl:latest",
 							Command: []string{"/bin/bash", "-c", script},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "target-descriptors",
+									MountPath: "/etc/liqo-target-descriptors",
+									ReadOnly:  true,
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "target-descriptors",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: targetDescriptorsConfigMap,
+									},
+									Optional: func() *bool { b := true; return &b }(),
+								},
+							},
 						},
 					},
 				},

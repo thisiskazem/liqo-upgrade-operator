@@ -152,6 +152,7 @@ func TestUpgradePlanSerialization(t *testing.T) {
 
 func TestLiqoComponentsDefinition(t *testing.T) {
 	// Verify that core Liqo components are defined
+	// Note: liqo-gateway removed - gateways are dynamically created via WgGatewayClientTemplate/WgGatewayServerTemplate
 	expectedComponents := map[string]string{
 		"liqo-controller-manager": "Deployment",
 		"liqo-crd-replicator":     "Deployment",
@@ -160,7 +161,7 @@ func TestLiqoComponentsDefinition(t *testing.T) {
 		"liqo-proxy":              "Deployment",
 		"liqo-telemetry":          "CronJob",
 		"liqo-fabric":             "DaemonSet",
-		"liqo-gateway":            "Deployment",
+		"liqo-metric-agent":       "Deployment",
 	}
 
 	componentMap := make(map[string]string)

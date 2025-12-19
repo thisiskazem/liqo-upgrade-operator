@@ -173,5 +173,5 @@ subjects:
   namespace: liqo
 # Also bind the controller manager ServiceAccount
 - kind: ServiceAccount
-  name: liqo-upgrade-controller-controller-manager
+  name: liqo-upgrade-controller-manager
   namespace: liqo-upgrade-controller-system

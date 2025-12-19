@@ -45,22 +45,44 @@ const (
 
 // UpgradePlan represents the computed upgrade plan comparing snapshot vs descriptor
 type UpgradePlan struct {
-	Version  string             `json:"version"`
-	ToCreate []PlannedComponent `json:"toCreate,omitempty"`
-	ToUpdate []PlannedComponent `json:"toUpdate,omitempty"`
-	ToDelete []PlannedComponent `json:"toDelete,omitempty"`
+	Version           string             `json:"version"`
+	ToCreate          []PlannedComponent `json:"toCreate,omitempty"`
+	ToUpdate          []PlannedComponent `json:"toUpdate,omitempty"`
+	ToDelete          []PlannedComponent `json:"toDelete,omitempty"`
+	TemplatesToUpdate []PlannedTemplate  `json:"templatesToUpdate,omitempty"`
+}
+
+// PlannedTemplate represents a template CRD that needs to be updated
+type PlannedTemplate struct {
+	Name             string                   `json:"name"`
+	Kind             string                   `json:"kind"`
+	Namespace        string                   `json:"namespace"`
+	ContainerChanges []PlannedContainerChange `json:"containerChanges,omitempty"`
+}
+
+// PlannedContainerChange represents changes to a container within a template
+type PlannedContainerChange struct {
+	ContainerName  string       `json:"containerName"`
+	CurrentImage   string       `json:"currentImage,omitempty"`
+	TargetImage    string       `json:"targetImage"`
+	CurrentCommand []string     `json:"currentCommand,omitempty"`
+	TargetCommand  []string     `json:"targetCommand,omitempty"`
+	EnvChanges     []EnvChange  `json:"envChanges,omitempty"`
+	FlagChanges    []FlagChange `json:"flagChanges,omitempty"`
 }
 
 // PlannedComponent represents a component that needs to be created, updated, or deleted
 type PlannedComponent struct {
-	Name          string       `json:"name"`
-	Namespace     string       `json:"namespace"`
-	Kind          string       `json:"kind"`
-	ContainerName string       `json:"containerName,omitempty"`
-	CurrentImage  string       `json:"currentImage,omitempty"`
-	TargetImage   string       `json:"targetImage"`
-	EnvChanges    []EnvChange  `json:"envChanges,omitempty"`
-	FlagChanges   []FlagChange `json:"flagChanges,omitempty"`
+	Name           string       `json:"name"`
+	Namespace      string       `json:"namespace"`
+	Kind           string       `json:"kind"`
+	ContainerName  string       `json:"containerName,omitempty"`
+	CurrentImage   string       `json:"currentImage,omitempty"`
+	TargetImage    string       `json:"targetImage"`
+	CurrentCommand []string     `json:"currentCommand,omitempty"`
+	TargetCommand  []string     `json:"targetCommand,omitempty"`
+	EnvChanges     []EnvChange  `json:"envChanges,omitempty"`
+	FlagChanges    []FlagChange `json:"flagChanges,omitempty"`
 }
 
 // EnvChange represents a change to an environment variable
@@ -88,10 +110,11 @@ func (r *LiqoUpgradeReconciler) buildUpgradePlan(ctx context.Context, snapshot *
 	logger.Info("Building upgrade plan", "currentVersion", snapshot.Version, "targetVersion", descriptor.Version)
 
 	plan := &UpgradePlan{
-		Version:  descriptor.Version,
-		ToCreate: []PlannedComponent{},
-		ToUpdate: []PlannedComponent{},
-		ToDelete: []PlannedComponent{},
+		Version:           descriptor.Version,
+		ToCreate:          []PlannedComponent{},
+		ToUpdate:          []PlannedComponent{},
+		ToDelete:          []PlannedComponent{},
+		TemplatesToUpdate: []PlannedTemplate{},
 	}
 
 	// Build maps for efficient lookup
@@ -159,7 +182,17 @@ func (r *LiqoUpgradeReconciler) buildUpgradePlan(ctx context.Context, snapshot *
 		}
 	}
 
-	logger.Info("Upgrade plan built", "toCreate", len(plan.ToCreate), "toUpdate", len(plan.ToUpdate), "toDelete", len(plan.ToDelete))
+	// 3. Compare template CRDs (VkOptionsTemplate, WgGatewayClientTemplate, WgGatewayServerTemplate)
+	templateChanges := r.compareTemplates(ctx, snapshot.Templates, descriptor.Templates)
+	if len(templateChanges) > 0 {
+		plan.TemplatesToUpdate = templateChanges
+		for _, t := range templateChanges {
+			logger.Info("Plan: UPDATE template", "name", t.Name, "kind", t.Kind, "containerChanges", len(t.ContainerChanges))
+		}
+	}
+
+	logger.Info("Upgrade plan built", "toCreate", len(plan.ToCreate), "toUpdate", len(plan.ToUpdate),
+		"toDelete", len(plan.ToDelete), "templatesToUpdate", len(plan.TemplatesToUpdate))
 	return plan
 }
 
@@ -180,14 +213,21 @@ func (r *LiqoUpgradeReconciler) compareComponent(current *ComponentSnapshot, tar
 	// 1. Compare images
 	hasChanges := current.Image != planned.TargetImage
 
-	// 2. Compare environment variables
+	// 2. Compare command (if changed)
+	if !stringSlicesEqual(current.Command, target.Command) {
+		planned.CurrentCommand = current.Command
+		planned.TargetCommand = target.Command
+		hasChanges = true
+	}
+
+	// 3. Compare environment variables
 	envChanges := r.compareEnvVars(current.Env, target.Env)
 	if len(envChanges) > 0 {
 		planned.EnvChanges = envChanges
 		hasChanges = true
 	}
 
-	// 3. Compare args/flags
+	// 4. Compare args/flags
 	flagChanges := r.compareArgs(current.Args, target.Args)
 	if len(flagChanges) > 0 {
 		planned.FlagChanges = flagChanges
@@ -199,6 +239,19 @@ func (r *LiqoUpgradeReconciler) compareComponent(current *ComponentSnapshot, tar
 	}
 
 	return planned
+}
+
+// stringSlicesEqual compares two string slices for equality
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // compareEnvVars compares current env vars with target env vars
@@ -394,6 +447,140 @@ func parseArgs(args []string) map[string]string {
 	}
 
 	return flags
+}
+
+// compareTemplates compares template snapshots with target descriptors
+func (r *LiqoUpgradeReconciler) compareTemplates(ctx context.Context, currentTemplates []TemplateSnapshot, targetTemplates []TargetTemplateDescriptor) []PlannedTemplate {
+	logger := log.FromContext(ctx)
+	var changes []PlannedTemplate
+
+	// Build maps for efficient lookup
+	currentMap := make(map[string]*TemplateSnapshot)
+	for i := range currentTemplates {
+		t := &currentTemplates[i]
+		key := fmt.Sprintf("%s/%s/%s", t.Kind, t.Namespace, t.Name)
+		currentMap[key] = t
+	}
+
+	// Compare each target template with current state
+	for _, target := range targetTemplates {
+		key := fmt.Sprintf("%s/%s/%s", target.Kind, target.Namespace, target.Name)
+		current, exists := currentMap[key]
+
+		if !exists || !current.Exists {
+			// Template doesn't exist - this is unusual but we can skip (template CRDs should exist)
+			logger.Info("Template not found in current cluster", "name", target.Name, "kind", target.Kind)
+			continue
+		}
+
+		// Compare containers within the template
+		containerChanges := r.compareTemplateContainers(current.Containers, target.Containers)
+		if len(containerChanges) > 0 {
+			changes = append(changes, PlannedTemplate{
+				Name:             target.Name,
+				Kind:             target.Kind,
+				Namespace:        target.Namespace,
+				ContainerChanges: containerChanges,
+			})
+		}
+	}
+
+	return changes
+}
+
+// compareTemplateContainers compares containers within templates
+func (r *LiqoUpgradeReconciler) compareTemplateContainers(current []TemplateContainerSnapshot, target []TargetTemplateContainerDescriptor) []PlannedContainerChange {
+	var changes []PlannedContainerChange
+
+	// Build map of current containers
+	currentMap := make(map[string]*TemplateContainerSnapshot)
+	for i := range current {
+		c := &current[i]
+		currentMap[c.Name] = c
+	}
+
+	// Compare each target container
+	for _, targetContainer := range target {
+		currentContainer, exists := currentMap[targetContainer.Name]
+
+		targetImage := fmt.Sprintf("%s:%s", targetContainer.Image.Repository, targetContainer.Image.Tag)
+
+		if !exists {
+			// New container in target - add with all env/args as new
+			change := PlannedContainerChange{
+				ContainerName: targetContainer.Name,
+				CurrentImage:  "",
+				TargetImage:   targetImage,
+				TargetCommand: targetContainer.Command,
+				EnvChanges:    []EnvChange{},
+				FlagChanges:   []FlagChange{},
+			}
+
+			// All args are new
+			for _, arg := range targetContainer.Args {
+				change.FlagChanges = append(change.FlagChanges, FlagChange{
+					Type:     "add",
+					Flag:     arg,
+					NewValue: arg,
+				})
+			}
+
+			// All env vars are new
+			for _, env := range targetContainer.Env {
+				change.EnvChanges = append(change.EnvChanges, EnvChange{
+					Type:      "add",
+					Name:      env.Name,
+					NewValue:  r.formatTargetEnvValue(env),
+					NewSource: r.formatTargetEnvSource(env),
+				})
+			}
+
+			changes = append(changes, change)
+			continue
+		}
+
+		// Container exists - compare image, command, args, and env
+		hasChanges := false
+		change := PlannedContainerChange{
+			ContainerName: targetContainer.Name,
+			CurrentImage:  currentContainer.Image,
+			TargetImage:   targetImage,
+			EnvChanges:    []EnvChange{},
+			FlagChanges:   []FlagChange{},
+		}
+
+		// Compare images
+		if currentContainer.Image != targetImage {
+			hasChanges = true
+		}
+
+		// Compare command
+		if !stringSlicesEqual(currentContainer.Command, targetContainer.Command) {
+			change.CurrentCommand = currentContainer.Command
+			change.TargetCommand = targetContainer.Command
+			hasChanges = true
+		}
+
+		// Compare args/flags
+		flagChanges := r.compareArgs(currentContainer.Args, targetContainer.Args)
+		if len(flagChanges) > 0 {
+			change.FlagChanges = flagChanges
+			hasChanges = true
+		}
+
+		// Compare env vars
+		envChanges := r.compareEnvVars(currentContainer.Env, targetContainer.Env)
+		if len(envChanges) > 0 {
+			change.EnvChanges = envChanges
+			hasChanges = true
+		}
+
+		if hasChanges {
+			changes = append(changes, change)
+		}
+	}
+
+	return changes
 }
 
 // isDynamicComponent checks if a component is dynamic (virtual-kubelet, tenant gateway)

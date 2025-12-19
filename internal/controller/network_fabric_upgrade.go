@@ -164,6 +164,275 @@ fi
 
 echo "Upgrade plan loaded"
 
+# ========================================
+# Helper Functions for Component Upgrade
+# ========================================
+
+# Function to upgrade a component using the upgrade plan (handles env vars and flags)
+upgrade_network_component() {
+  local COMPONENT_NAME=$1
+  local COMPONENT_KIND=$2  # "Deployment" or "DaemonSet"
+  local NAMESPACE=$3
+  local IMAGE_NAME=$4  # e.g., "ipam", "proxy", "fabric"
+  
+  echo ""
+  echo "--- Upgrading ${COMPONENT_NAME} (${COMPONENT_KIND}) ---"
+  
+  local RESOURCE_TYPE=$(echo "$COMPONENT_KIND" | tr '[:upper:]' '[:lower:]')
+  
+  # Check if component exists
+  if ! kubectl get "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" > /dev/null 2>&1; then
+    echo "⚠️  Component ${COMPONENT_NAME} not found, skipping"
+    return 0
+  fi
+
+  # Find component in upgrade plan
+  COMPONENT_PLAN=$(echo "$PLAN_JSON" | jq -r --arg name "$COMPONENT_NAME" '
+    .toUpdate[] | select(.name == $name)
+  ')
+
+  if [ -z "$COMPONENT_PLAN" ] || [ "$COMPONENT_PLAN" == "null" ]; then
+    echo "⚠️  No update plan for ${COMPONENT_NAME}, using default image update only"
+
+    # Fallback: simple image update
+    NEW_IMAGE="${IMAGE_REGISTRY}/${IMAGE_NAME}:${TARGET_VERSION}"
+    echo "Updating image to: ${NEW_IMAGE}"
+
+    CONTAINER_NAME=$(kubectl get "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
+    kubectl set image "${RESOURCE_TYPE}/${COMPONENT_NAME}" \
+      "${CONTAINER_NAME}=${NEW_IMAGE}" \
+      -n "${NAMESPACE}"
+  else
+    echo "Applying upgrade plan for ${COMPONENT_NAME}..."
+
+    # Extract plan details
+    TARGET_IMAGE=$(echo "$COMPONENT_PLAN" | jq -r '.targetImage')
+    CONTAINER_NAME=$(echo "$COMPONENT_PLAN" | jq -r '.containerName // .name')
+
+    # Verify container name exists in the resource, fallback to actual if plan's name is wrong
+    ACTUAL_CONTAINER=$(kubectl get "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+      -o jsonpath='{.spec.template.spec.containers[0].name}' 2>/dev/null)
+    if [ -n "$ACTUAL_CONTAINER" ] && [ "$CONTAINER_NAME" != "$ACTUAL_CONTAINER" ]; then
+      echo "  ⚠️  Plan container name '${CONTAINER_NAME}' not found, using actual: '${ACTUAL_CONTAINER}'"
+      CONTAINER_NAME="$ACTUAL_CONTAINER"
+    fi
+
+    echo "  Target image: ${TARGET_IMAGE}"
+    echo "  Container name: ${CONTAINER_NAME}"
+
+    # Update image
+    echo ""
+    echo "Updating container image..."
+    kubectl set image "${RESOURCE_TYPE}/${COMPONENT_NAME}" \
+      "${CONTAINER_NAME}=${TARGET_IMAGE}" \
+      -n "${NAMESPACE}"
+
+    # Apply environment variable changes
+    ENV_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.envChanges // []')
+    ENV_COUNT=$(echo "$ENV_CHANGES" | jq 'length')
+
+    if [ "$ENV_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Applying ${ENV_COUNT} environment variable change(s)..."
+
+      # Get current env array
+      CURRENT_ENV=$(kubectl get "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" -o json | \
+        jq '.spec.template.spec.containers[] | select(.name == "'${CONTAINER_NAME}'") | .env // []')
+
+      # Process each env change and build new env array
+      NEW_ENV="$CURRENT_ENV"
+      while IFS= read -r change; do
+        TYPE=$(echo "$change" | jq -r '.type')
+        NAME=$(echo "$change" | jq -r '.name')
+        NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+        NEW_SOURCE=$(echo "$change" | jq -r '.newSource // ""')
+
+        if [ "$TYPE" == "add" ] || [ "$TYPE" == "update" ]; then
+          # Determine the source type and build appropriate env var
+          if [ "$NEW_SOURCE" == "value" ]; then
+            echo "  ${TYPE}: ${NAME}=${NEW_VALUE}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg value "$NEW_VALUE" \
+              '{name: $name, value: $value}')
+          elif [[ "$NEW_SOURCE" == configMap:* ]]; then
+            CONFIGMAP_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+            KEY=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from ConfigMap ${CONFIGMAP_NAME}, key: ${KEY}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg cmName "$CONFIGMAP_NAME" --arg key "$KEY" \
+              '{name: $name, valueFrom: {configMapKeyRef: {name: $cmName, key: $key}}}')
+          elif [[ "$NEW_SOURCE" == secret:* ]]; then
+            SECRET_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+            KEY=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from Secret ${SECRET_NAME}, key: ${KEY}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg secretName "$SECRET_NAME" --arg key "$KEY" \
+              '{name: $name, valueFrom: {secretKeyRef: {name: $secretName, key: $key}}}')
+          elif [ "$NEW_SOURCE" == "fieldRef" ]; then
+            FIELD_PATH=$(echo "$NEW_VALUE")
+            echo "  ${TYPE}: ${NAME} from fieldRef: ${FIELD_PATH}"
+            ENV_VAR=$(jq -n --arg name "$NAME" --arg fieldPath "$FIELD_PATH" \
+              '{name: $name, valueFrom: {fieldRef: {apiVersion: "v1", fieldPath: $fieldPath}}}')
+          else
+            echo "  ⚠️  WARNING: Unknown source type for ${NAME}: ${NEW_SOURCE}, skipping"
+            continue
+          fi
+
+          # Update or add the env var in the array
+          if echo "$NEW_ENV" | jq -e --arg name "$NAME" 'any(.[]; .name == $name)' > /dev/null; then
+            NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" --arg name "$NAME" \
+              'map(if .name == $name then $envVar else . end)')
+          else
+            NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" '. += [$envVar]')
+          fi
+        elif [ "$TYPE" == "remove" ]; then
+          echo "  ${TYPE}: ${NAME}"
+          NEW_ENV=$(echo "$NEW_ENV" | jq --arg name "$NAME" 'map(select(.name != $name))')
+        fi
+      done < <(echo "$ENV_CHANGES" | jq -c '.[]')
+
+      # Apply the complete env array patch
+      PATCH=$(cat <<ENVPATCH
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "${CONTAINER_NAME}",
+          "env": ${NEW_ENV}
+        }]
+      }
+    }
+  }
+}
+ENVPATCH
+)
+      kubectl patch "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" --type=strategic --patch "$PATCH"
+    else
+      echo ""
+      echo "No environment variable changes needed"
+    fi
+
+    # Apply command-line flag changes (via args)
+    FLAG_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.flagChanges // []')
+    FLAG_COUNT=$(echo "$FLAG_CHANGES" | jq 'length')
+
+    if [ "$FLAG_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Applying ${FLAG_COUNT} command-line flag change(s)..."
+
+      # Get current args
+      CURRENT_ARGS=$(kubectl get "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+        -o jsonpath="{.spec.template.spec.containers[?(@.name=='${CONTAINER_NAME}')].args}" | jq -r '.' 2>/dev/null || echo "[]")
+
+      if [ -z "$CURRENT_ARGS" ] || [ "$CURRENT_ARGS" == "null" ]; then
+        CURRENT_ARGS="[]"
+      fi
+
+      # Build new args array by applying changes
+      NEW_ARGS="$CURRENT_ARGS"
+      while IFS= read -r change; do
+        TYPE=$(echo "$change" | jq -r '.type')
+        FLAG=$(echo "$change" | jq -r '.flag')
+        NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+
+        if [ "$TYPE" == "add" ]; then
+          echo "  add: --${FLAG}=${NEW_VALUE}"
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+        elif [ "$TYPE" == "update" ]; then
+          echo "  update: --${FLAG}=${NEW_VALUE}"
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+        elif [ "$TYPE" == "remove" ]; then
+          echo "  remove: --${FLAG}"
+          NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+        fi
+      done < <(echo "$FLAG_CHANGES" | jq -c '.[]')
+
+      # Apply args patch
+      ARGS_PATCH=$(cat <<ARGSPATCH
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "${CONTAINER_NAME}",
+          "args": ${NEW_ARGS}
+        }]
+      }
+    }
+  }
+}
+ARGSPATCH
+)
+      kubectl patch "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+        --type=strategic --patch "$ARGS_PATCH"
+    else
+      echo ""
+      echo "No command-line flag changes needed"
+    fi
+
+    # Apply command changes (if any)
+    TARGET_COMMAND=$(echo "$COMPONENT_PLAN" | jq -r '.targetCommand // []')
+    COMMAND_COUNT=$(echo "$TARGET_COMMAND" | jq 'length')
+
+    if [ "$COMMAND_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Applying command change..."
+      echo "  Target command: $(echo "$TARGET_COMMAND" | jq -c '.')"
+
+      # Apply command patch
+      COMMAND_PATCH=$(cat <<COMMANDPATCH
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "${CONTAINER_NAME}",
+          "command": ${TARGET_COMMAND}
+        }]
+      }
+    }
+  }
+}
+COMMANDPATCH
+)
+      kubectl patch "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" --type=strategic --patch "$COMMAND_PATCH"
+      echo "  ✓ Command updated"
+    else
+      echo ""
+      echo "No command changes needed"
+    fi
+  fi
+
+  # Wait for rollout
+  echo ""
+  echo "Waiting for rollout to complete..."
+  if ! kubectl rollout status "${RESOURCE_TYPE}/${COMPONENT_NAME}" -n "${NAMESPACE}" --timeout=5m; then
+    echo "❌ ERROR: Rollout failed for ${COMPONENT_NAME}!"
+    return 1
+  fi
+
+  # Verify health
+  echo ""
+  echo "Verifying ${COMPONENT_KIND} health..."
+  if [ "$COMPONENT_KIND" == "Deployment" ]; then
+    if ! kubectl wait --for=condition=available --timeout=2m "${RESOURCE_TYPE}/${COMPONENT_NAME}" -n "${NAMESPACE}"; then
+      echo "❌ ERROR: ${COMPONENT_NAME} not healthy!"
+      return 1
+    fi
+  else
+    # DaemonSet - check number ready
+    DESIRED=$(kubectl get "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.desiredNumberScheduled}')
+    READY=$(kubectl get "${RESOURCE_TYPE}" "${COMPONENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.numberReady}')
+    if [ "${DESIRED}" != "${READY}" ]; then
+      echo "❌ ERROR: Not all pods ready! Desired: ${DESIRED}, Ready: ${READY}"
+      return 1
+    fi
+  fi
+
+  echo ""
+  echo "✅ ${COMPONENT_NAME} upgraded successfully"
+  return 0
+}
+
 echo ""
 echo "========================================="
 echo "Step 1: Backing up network fabric deployments..."
@@ -406,60 +675,203 @@ echo "✅ Gateway HA Mode Enabled: ${GATEWAYS_HA_READY} gateway(s) with 2 replic
 
 echo ""
 echo "========================================="
-echo "Step 6: Upgrading gateway images in templates..."
+echo "Step 6: Upgrading gateway templates (images, env vars, args)..."
 echo "========================================="
 echo ""
-echo "Now updating gateway images. RollingUpdate will upgrade one pod at a time."
+echo "Now updating gateway templates using upgrade plan. RollingUpdate will upgrade one pod at a time."
 
+# Function to upgrade a WgGateway template using the upgrade plan
+upgrade_wg_gateway_template() {
+  local TEMPLATE_NAME=$1
+  local TEMPLATE_KIND=$2
+  local RESOURCE_TYPE=$3  # "wggatewayclienttemplate" or "wggatewayservertemplate"
+  
+  echo ""
+  echo "--- Upgrading ${TEMPLATE_KIND}: ${TEMPLATE_NAME} ---"
+  
+  # Check if template exists
+  if ! kubectl get "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" &>/dev/null; then
+    echo "  ℹ️  ${TEMPLATE_KIND} ${TEMPLATE_NAME} not found, skipping"
+    return 0
+  fi
+  
+  # Find template in upgrade plan
+  TEMPLATE_PLAN=$(echo "$PLAN_JSON" | jq -r --arg name "$TEMPLATE_NAME" --arg kind "$TEMPLATE_KIND" '
+    .templatesToUpdate[] | select(.name == $name and .kind == $kind)
+  ')
+  
+  if [ -z "$TEMPLATE_PLAN" ] || [ "$TEMPLATE_PLAN" == "null" ]; then
+    echo "  ⚠️  No update plan for ${TEMPLATE_NAME}, using fallback image upgrade"
+    
+    # Fallback: simple image update for all containers
+    kubectl patch "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" \
+      --type='json' -p='[
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${TARGET_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${TARGET_VERSION}"'"},
+        {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${TARGET_VERSION}"'"}
+      ]' && echo "  ✓ ${TEMPLATE_NAME} images updated (fallback)" || echo "  ⚠️  Warning: Could not update images"
+  else
+    echo "  Applying upgrade plan for ${TEMPLATE_NAME}..."
+    
+    # Get container changes from plan
+    CONTAINER_CHANGES=$(echo "$TEMPLATE_PLAN" | jq -r '.containerChanges // []')
+    CONTAINER_COUNT=$(echo "$CONTAINER_CHANGES" | jq 'length')
+    
+    if [ "$CONTAINER_COUNT" -gt 0 ]; then
+      echo "  Found ${CONTAINER_COUNT} container(s) to update"
+      
+      # Get current containers from template
+      CURRENT_CONTAINERS=$(kubectl get "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" \
+        -o json | jq '.spec.template.spec.deployment.spec.template.spec.containers')
+      
+      # Process each container change
+      CONTAINER_INDEX=0
+      while IFS= read -r container_change; do
+        CONTAINER_NAME=$(echo "$container_change" | jq -r '.containerName')
+        TARGET_IMAGE=$(echo "$container_change" | jq -r '.targetImage')
+        ENV_CHANGES=$(echo "$container_change" | jq -r '.envChanges // []')
+        FLAG_CHANGES=$(echo "$container_change" | jq -r '.flagChanges // []')
+        
+        echo ""
+        echo "  Processing container: ${CONTAINER_NAME}"
+        
+        # Find container index in current spec
+        CONTAINER_INDEX=$(echo "$CURRENT_CONTAINERS" | jq -r --arg name "$CONTAINER_NAME" 'to_entries[] | select(.value.name == $name) | .key')
+        
+        if [ -z "$CONTAINER_INDEX" ]; then
+          echo "    ⚠️  Container ${CONTAINER_NAME} not found in template, skipping"
+          continue
+        fi
+        
+        echo "    Container index: ${CONTAINER_INDEX}"
+        echo "    Target image: ${TARGET_IMAGE}"
+        
+        # Update image
+        kubectl patch "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" \
+          --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/'"${CONTAINER_INDEX}"'/image", "value": "'"${TARGET_IMAGE}"'"}]' \
+          && echo "    ✓ Image updated" || echo "    ⚠️  Warning: Could not update image"
+        
+        # Apply env var changes
+        ENV_COUNT=$(echo "$ENV_CHANGES" | jq 'length')
+        if [ "$ENV_COUNT" -gt 0 ]; then
+          echo "    Applying ${ENV_COUNT} env var change(s)..."
+          
+          # Get current env for this container
+          CURRENT_ENV=$(echo "$CURRENT_CONTAINERS" | jq --argjson idx "$CONTAINER_INDEX" '.[$idx].env // []')
+          NEW_ENV="$CURRENT_ENV"
+          
+          while IFS= read -r change; do
+            TYPE=$(echo "$change" | jq -r '.type')
+            NAME=$(echo "$change" | jq -r '.name')
+            NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+            NEW_SOURCE=$(echo "$change" | jq -r '.newSource // ""')
+            
+            if [ "$TYPE" == "add" ] || [ "$TYPE" == "update" ]; then
+              if [ "$NEW_SOURCE" == "value" ]; then
+                echo "      ${TYPE}: ${NAME}=${NEW_VALUE}"
+                ENV_VAR=$(jq -n --arg name "$NAME" --arg value "$NEW_VALUE" '{name: $name, value: $value}')
+              elif [[ "$NEW_SOURCE" == configMap:* ]]; then
+                CONFIGMAP_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+                echo "      ${TYPE}: ${NAME} from ConfigMap ${CONFIGMAP_NAME}"
+                ENV_VAR=$(jq -n --arg name "$NAME" --arg cmName "$CONFIGMAP_NAME" --arg key "$NEW_VALUE" \
+                  '{name: $name, valueFrom: {configMapKeyRef: {name: $cmName, key: $key}}}')
+              elif [[ "$NEW_SOURCE" == secret:* ]]; then
+                SECRET_NAME=$(echo "$NEW_SOURCE" | cut -d: -f2)
+                echo "      ${TYPE}: ${NAME} from Secret ${SECRET_NAME}"
+                ENV_VAR=$(jq -n --arg name "$NAME" --arg secretName "$SECRET_NAME" --arg key "$NEW_VALUE" \
+                  '{name: $name, valueFrom: {secretKeyRef: {name: $secretName, key: $key}}}')
+              elif [ "$NEW_SOURCE" == "fieldRef" ]; then
+                echo "      ${TYPE}: ${NAME} from fieldRef: ${NEW_VALUE}"
+                ENV_VAR=$(jq -n --arg name "$NAME" --arg fieldPath "$NEW_VALUE" \
+                  '{name: $name, valueFrom: {fieldRef: {apiVersion: "v1", fieldPath: $fieldPath}}}')
+              else
+                continue
+              fi
+              
+              if echo "$NEW_ENV" | jq -e --arg name "$NAME" 'any(.[]; .name == $name)' > /dev/null 2>&1; then
+                NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" --arg name "$NAME" \
+                  'map(if .name == $name then $envVar else . end)')
+              else
+                NEW_ENV=$(echo "$NEW_ENV" | jq --argjson envVar "$ENV_VAR" '. += [$envVar]')
+              fi
+            elif [ "$TYPE" == "remove" ]; then
+              echo "      ${TYPE}: ${NAME}"
+              NEW_ENV=$(echo "$NEW_ENV" | jq --arg name "$NAME" 'map(select(.name != $name))')
+            fi
+          done < <(echo "$ENV_CHANGES" | jq -c '.[]')
+          
+          # Apply env patch
+          kubectl patch "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" \
+            --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/'"${CONTAINER_INDEX}"'/env", "value": '"${NEW_ENV}"'}]' \
+            && echo "    ✓ Env vars updated" || echo "    ⚠️  Warning: Could not update env vars"
+        fi
+        
+        # Apply flag/args changes
+        FLAG_COUNT=$(echo "$FLAG_CHANGES" | jq 'length')
+        if [ "$FLAG_COUNT" -gt 0 ]; then
+          echo "    Applying ${FLAG_COUNT} flag change(s)..."
+          
+          # Get current args for this container
+          CURRENT_ARGS=$(echo "$CURRENT_CONTAINERS" | jq --argjson idx "$CONTAINER_INDEX" '.[$idx].args // []')
+          NEW_ARGS="$CURRENT_ARGS"
+          
+          while IFS= read -r change; do
+            TYPE=$(echo "$change" | jq -r '.type')
+            FLAG=$(echo "$change" | jq -r '.flag')
+            NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+            
+            if [ "$TYPE" == "add" ]; then
+              echo "      add: --${FLAG}=${NEW_VALUE}"
+              NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+            elif [ "$TYPE" == "update" ]; then
+              echo "      update: --${FLAG}=${NEW_VALUE}"
+              NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+              NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+            elif [ "$TYPE" == "remove" ]; then
+              echo "      remove: --${FLAG}"
+              NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+            fi
+          done < <(echo "$FLAG_CHANGES" | jq -c '.[]')
+          
+          # Apply args patch
+          kubectl patch "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" \
+            --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/'"${CONTAINER_INDEX}"'/args", "value": '"${NEW_ARGS}"'}]' \
+            && echo "    ✓ Args updated" || echo "    ⚠️  Warning: Could not update args"
+        fi
 
-# Upgrade WgGatewayClientTemplate images
-echo "--- Upgrading WgGatewayClientTemplate ---"
-if kubectl get wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" &>/dev/null; then
-  echo "Updating WgGatewayClientTemplate to version ${TARGET_VERSION}..."
-
-  # Patch the template to update container images
-  kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
-    --type='json' -p='[
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ WgGatewayClientTemplate images updated" || echo "  ⚠️  Warning: Could not update WgGatewayClientTemplate images"
+        # Apply command changes
+        TARGET_COMMAND=$(echo "$container_change" | jq -r '.targetCommand // []')
+        COMMAND_COUNT=$(echo "$TARGET_COMMAND" | jq 'length')
+        if [ "$COMMAND_COUNT" -gt 0 ]; then
+          echo "    Applying command change..."
+          echo "      Target command: $(echo "$TARGET_COMMAND" | jq -c '.')"
+          kubectl patch "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" \
+            --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/'"${CONTAINER_INDEX}"'/command", "value": '"${TARGET_COMMAND}"'}]' \
+            && echo "    ✓ Command updated" || echo "    ⚠️  Warning: Could not update command"
+        fi
+        
+      done < <(echo "$CONTAINER_CHANGES" | jq -c '.[]')
+    fi
+  fi
   
   # Update version labels in template
-  kubectl patch wggatewayclienttemplate wireguard-client -n "${NAMESPACE}" \
+  kubectl patch "${RESOURCE_TYPE}" "${TEMPLATE_NAME}" -n "${NAMESPACE}" \
     --type='json' -p='[
       {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
       {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"},
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
       {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ WgGatewayClientTemplate labels updated" || echo "  ⚠️  Warning: Could not update WgGatewayClientTemplate labels"
-else
-  echo "  ℹ️  WgGatewayClientTemplate not found, skipping"
-fi
-
-# Upgrade WgGatewayServerTemplate images
-echo "--- Upgrading WgGatewayServerTemplate ---"
-if kubectl get wggatewayservertemplate wireguard-server -n "${NAMESPACE}" &>/dev/null; then
-  echo "Updating WgGatewayServerTemplate to version ${TARGET_VERSION}..."
-
-  kubectl patch wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
-    --type='json' -p='[
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/0/image", "value": "'"${IMAGE_REGISTRY}"'/gateway:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/1/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/wireguard:'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/spec/containers/2/image", "value": "'"${IMAGE_REGISTRY}"'/gateway/geneve:'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ WgGatewayServerTemplate images updated" || echo "  ⚠️  Warning: Could not update WgGatewayServerTemplate images"
+    ]' && echo "  ✓ ${TEMPLATE_NAME} labels updated" || echo "  ⚠️  Warning: Could not update labels"
   
-  # Update version labels in template
-  kubectl patch wggatewayservertemplate wireguard-server -n "${NAMESPACE}" \
-    --type='json' -p='[
-      {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/app.kubernetes.io~1version", "value": "'"${TARGET_VERSION}"'"},
-      {"op": "replace", "path": "/spec/template/spec/deployment/spec/template/metadata/labels/helm.sh~1chart", "value": "liqo-'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ WgGatewayServerTemplate labels updated" || echo "  ⚠️  Warning: Could not update WgGatewayServerTemplate labels"
-else
-  echo "  ℹ️  WgGatewayServerTemplate not found, skipping"
-fi
+  echo "  ✅ ${TEMPLATE_NAME} upgrade complete"
+  return 0
+}
+
+# Upgrade WgGatewayClientTemplate
+upgrade_wg_gateway_template "wireguard-client" "WgGatewayClientTemplate" "wggatewayclienttemplate"
+
+# Upgrade WgGatewayServerTemplate
+upgrade_wg_gateway_template "wireguard-server" "WgGatewayServerTemplate" "wggatewayservertemplate"
 
 # Verify templates were updated
 sleep 2
@@ -547,143 +959,48 @@ update_version_labels() {
 }
 
 # Upgrade liqo-ipam first (less critical, manages IP allocation)
-if kubectl get deployment liqo-ipam -n "${NAMESPACE}" &>/dev/null; then
-  echo ""
-  echo "--- Upgrading liqo-ipam ---"
-  echo "Extracting environment variables..."
-
-  # Get current environment variables
-  ENV_JSON=$(kubectl get deployment liqo-ipam -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].env}')
-  echo "  Current environment variables preserved in deployment spec"
-
-  NEW_IMAGE="${IMAGE_REGISTRY}/ipam:${TARGET_VERSION}"
-  echo "New image: ${NEW_IMAGE}"
-
-  CONTAINER_NAME=$(kubectl get deployment liqo-ipam -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-  kubectl set image deployment/liqo-ipam \
-    "${CONTAINER_NAME}=${NEW_IMAGE}" \
-    -n "${NAMESPACE}"
-
-  echo "Waiting for rollout..."
-  if ! kubectl rollout status deployment/liqo-ipam -n "${NAMESPACE}" --timeout=5m; then
-    echo "❌ ERROR: liqo-ipam rollout failed!"
-    exit 1
-  fi
-
-  echo "Verifying health..."
-  if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-ipam -n "${NAMESPACE}"; then
-    echo "❌ ERROR: liqo-ipam not healthy!"
-    exit 1
-  fi
-
-  echo "✅ liqo-ipam upgraded successfully"
-
-  # Health check after ipam upgrade
-  check_component_health "liqo-ipam" "Deployment" "${NAMESPACE}" || {
-    echo "❌ ERROR: liqo-ipam health check failed!"
-    exit 1
-  }
-  
-  # Update version labels
-  update_version_labels "liqo-ipam" "Deployment" "${NAMESPACE}" "${TARGET_VERSION}"
+if ! upgrade_network_component "liqo-ipam" "Deployment" "${NAMESPACE}" "ipam"; then
+  echo "❌ ERROR: Failed to upgrade liqo-ipam"
+  exit 1
 fi
+check_component_health "liqo-ipam" "Deployment" "${NAMESPACE}" || {
+  echo "❌ ERROR: liqo-ipam health check failed!"
+  exit 1
+}
+update_version_labels "liqo-ipam" "Deployment" "${NAMESPACE}" "${TARGET_VERSION}"
 
 # Upgrade liqo-proxy (Deployment)
-if kubectl get deployment liqo-proxy -n "${NAMESPACE}" &>/dev/null; then
-  echo ""
-  echo "--- Upgrading liqo-proxy ---"
-  echo "Extracting environment variables..."
-
-  # Get current environment variables
-  ENV_JSON=$(kubectl get deployment liqo-proxy -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].env}')
-  echo "  Current environment variables preserved in deployment spec"
-
-  NEW_IMAGE="${IMAGE_REGISTRY}/proxy:${TARGET_VERSION}"
-  echo "New image: ${NEW_IMAGE}"
-
-  CONTAINER_NAME=$(kubectl get deployment liqo-proxy -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-  kubectl set image deployment/liqo-proxy \
-    "${CONTAINER_NAME}=${NEW_IMAGE}" \
-    -n "${NAMESPACE}"
-
-  echo "Waiting for rollout..."
-  if ! kubectl rollout status deployment/liqo-proxy -n "${NAMESPACE}" --timeout=5m; then
-    echo "❌ ERROR: liqo-proxy rollout failed!"
-    exit 1
-  fi
-
-  echo "Verifying health..."
-  if ! kubectl wait --for=condition=available --timeout=2m deployment/liqo-proxy -n "${NAMESPACE}"; then
-    echo "❌ ERROR: liqo-proxy not healthy!"
-    exit 1
-  fi
-
-  echo "✅ liqo-proxy upgraded successfully"
-
-  # Health check after proxy upgrade
-  check_component_health "liqo-proxy" "Deployment" "${NAMESPACE}" || {
-    echo "❌ ERROR: liqo-proxy health check failed!"
-    exit 1
-  }
-  
-  # Update version labels
-  update_version_labels "liqo-proxy" "Deployment" "${NAMESPACE}" "${TARGET_VERSION}"
+if ! upgrade_network_component "liqo-proxy" "Deployment" "${NAMESPACE}" "proxy"; then
+  echo "❌ ERROR: Failed to upgrade liqo-proxy"
+  exit 1
 fi
+check_component_health "liqo-proxy" "Deployment" "${NAMESPACE}" || {
+  echo "❌ ERROR: liqo-proxy health check failed!"
+  exit 1
+}
+update_version_labels "liqo-proxy" "Deployment" "${NAMESPACE}" "${TARGET_VERSION}"
 
 # Upgrade liqo-fabric (DaemonSet) - Data plane component
-if kubectl get daemonset liqo-fabric -n "${NAMESPACE}" &>/dev/null; then
-  echo ""
-  echo "--- Upgrading liqo-fabric (DaemonSet - Data Plane) ---"
-  echo "⚠️  WARNING: This may cause temporary network disruption"
-  echo "Extracting environment variables..."
-
-  # Get current environment variables
-  ENV_JSON=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].env}')
-  echo "  Current environment variables preserved in daemonset spec"
-
-  NEW_IMAGE="${IMAGE_REGISTRY}/fabric:${TARGET_VERSION}"
-  echo "New image: ${NEW_IMAGE}"
-
-  CONTAINER_NAME=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].name}')
-  kubectl set image daemonset/liqo-fabric \
-    "${CONTAINER_NAME}=${NEW_IMAGE}" \
-    -n "${NAMESPACE}"
-
-  echo "Waiting for DaemonSet rollout (this may take several minutes)..."
-  if ! kubectl rollout status daemonset/liqo-fabric -n "${NAMESPACE}" --timeout=10m; then
-    echo "❌ ERROR: liqo-fabric rollout failed!"
-    exit 1
-  fi
-
-  echo "Verifying all fabric pods..."
-  DESIRED=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.status.desiredNumberScheduled}')
-  READY=$(kubectl get daemonset liqo-fabric -n "${NAMESPACE}" -o jsonpath='{.status.numberReady}')
-
-  if [ "${DESIRED}" != "${READY}" ]; then
-    echo "❌ ERROR: Not all fabric pods ready! Desired: ${DESIRED}, Ready: ${READY}"
-    exit 1
-  fi
-
-  echo "✅ liqo-fabric upgraded successfully (${READY}/${DESIRED} pods ready)"
-
-  # Health check after fabric upgrade
-  check_component_health "liqo-fabric" "DaemonSet" "${NAMESPACE}" || {
-    echo "❌ ERROR: liqo-fabric health check failed!"
-    exit 1
-  }
-
-  # Check routes are still present after fabric upgrade
-  echo "  Verifying network routes..."
-  ROUTE_COUNT=$(kubectl exec -n "${NAMESPACE}" daemonset/liqo-fabric -- ip route | wc -l 2>/dev/null || echo "0")
-  if [ "$ROUTE_COUNT" -gt 0 ]; then
-    echo "    ✓ Network routes present (${ROUTE_COUNT} routes)"
-  else
-    echo "    ⚠️  WARNING: Could not verify network routes"
-  fi
-  
-  # Update version labels
-  update_version_labels "liqo-fabric" "DaemonSet" "${NAMESPACE}" "${TARGET_VERSION}"
+echo ""
+echo "⚠️  WARNING: liqo-fabric upgrade may cause temporary network disruption"
+if ! upgrade_network_component "liqo-fabric" "DaemonSet" "${NAMESPACE}" "fabric"; then
+  echo "❌ ERROR: Failed to upgrade liqo-fabric"
+  exit 1
 fi
+check_component_health "liqo-fabric" "DaemonSet" "${NAMESPACE}" || {
+  echo "❌ ERROR: liqo-fabric health check failed!"
+  exit 1
+}
+
+# Check routes are still present after fabric upgrade
+echo "  Verifying network routes..."
+ROUTE_COUNT=$(kubectl exec -n "${NAMESPACE}" daemonset/liqo-fabric -- ip route | wc -l 2>/dev/null || echo "0")
+if [ "$ROUTE_COUNT" -gt 0 ]; then
+  echo "    ✓ Network routes present (${ROUTE_COUNT} routes)"
+else
+  echo "    ⚠️  WARNING: Could not verify network routes"
+fi
+update_version_labels "liqo-fabric" "DaemonSet" "${NAMESPACE}" "${TARGET_VERSION}"
 
 # Upgrade virtual-kubelet components (if present)
 echo ""
@@ -1549,26 +1866,37 @@ echo ""
 FABRIC_POD=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 
 if [ -n "$FABRIC_POD" ]; then
-  MAX_RETRIES=30
-  RETRY_COUNT=0
-  API_REACHABLE=false
+  # First check if wget or curl exists in the pod
+  TOOLS_AVAILABLE=false
+  if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c 'command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1' 2>/dev/null; then
+    TOOLS_AVAILABLE=true
+  fi
 
-  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    # Try to reach API server from within the fabric pod
-    if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c 'wget -q -O /dev/null --timeout=5 --no-check-certificate https://kubernetes.default.svc/healthz 2>/dev/null || curl -k -s -o /dev/null --connect-timeout 5 https://kubernetes.default.svc/healthz 2>/dev/null' 2>/dev/null; then
-      echo "  ✓ Fabric can reach API Server"
-      API_REACHABLE=true
-      break
+  if [ "$TOOLS_AVAILABLE" = "true" ]; then
+    MAX_RETRIES=10
+    RETRY_COUNT=0
+    API_REACHABLE=false
+
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+      # Try to reach API server from within the fabric pod
+      if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c 'wget -q -O /dev/null --timeout=5 --no-check-certificate https://kubernetes.default.svc/healthz 2>/dev/null || curl -k -s -o /dev/null --connect-timeout 5 https://kubernetes.default.svc/healthz 2>/dev/null' 2>/dev/null; then
+        echo "  ✓ Fabric can reach API Server"
+        API_REACHABLE=true
+        break
+      fi
+      echo "  ⏳ Waiting for API connectivity... ($RETRY_COUNT/$MAX_RETRIES)"
+      sleep 2
+      RETRY_COUNT=$((RETRY_COUNT+1))
+    done
+
+    if [ "$API_REACHABLE" != "true" ]; then
+      echo "  ⚠️ WARNING: Fabric cannot reach API Server after ${MAX_RETRIES} attempts"
+      echo "  This may be temporary - proceeding with upgrade."
+      echo "  Note: Fabric will retry API connection automatically."
     fi
-    echo "  ⏳ Waiting for API connectivity... ($RETRY_COUNT/$MAX_RETRIES)"
-    sleep 5
-    RETRY_COUNT=$((RETRY_COUNT+1))
-  done
-
-  if [ "$API_REACHABLE" != "true" ]; then
-    echo "  ⚠️ WARNING: Fabric cannot reach API Server after ${MAX_RETRIES} attempts"
-    echo "  This may be temporary - proceeding with upgrade."
-    echo "  Note: Fabric will retry API connection automatically."
+  else
+    echo "  ℹ️ wget/curl not available in fabric pod - skipping API connectivity check"
+    echo "  Note: Fabric uses native Go HTTP client and will connect automatically."
   fi
 else
   echo "  ⚠️ Warning: No fabric pod found to verify API connectivity"
@@ -1591,17 +1919,94 @@ else
   echo "  ✓ liqo-ipam is healthy"
 fi
 
-# Upgrade VkOptionsTemplate
+# Upgrade VkOptionsTemplate (image and extraArgs from upgrade plan)
 echo ""
 echo "--- Upgrading VkOptionsTemplate ---"
 if kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" &>/dev/null; then
-  echo "Updating VkOptionsTemplate to version ${TARGET_VERSION}..."
-
-  # Patch the template to update the virtual-kubelet container image
-  kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
-    --type='json' -p='[
-      {"op": "replace", "path": "/spec/containerImage", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${TARGET_VERSION}"'"}
-    ]' && echo "  ✓ VkOptionsTemplate updated" || echo "  ⚠️  Warning: Could not update VkOptionsTemplate"
+  echo "Updating VkOptionsTemplate..."
+  
+  # Find VkOptionsTemplate in upgrade plan
+  VK_TEMPLATE_PLAN=$(echo "$PLAN_JSON" | jq -r '
+    .templatesToUpdate[] | select(.name == "virtual-kubelet-default" and .kind == "VkOptionsTemplate")
+  ')
+  
+  if [ -z "$VK_TEMPLATE_PLAN" ] || [ "$VK_TEMPLATE_PLAN" == "null" ]; then
+    echo "  ⚠️  No update plan for VkOptionsTemplate, using fallback image upgrade"
+    
+    # Fallback: simple image update
+    kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+      --type='json' -p='[
+        {"op": "replace", "path": "/spec/containerImage", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${TARGET_VERSION}"'"}
+      ]' && echo "  ✓ VkOptionsTemplate image updated (fallback)" || echo "  ⚠️  Warning: Could not update VkOptionsTemplate"
+  else
+    echo "  Applying upgrade plan for VkOptionsTemplate..."
+    
+    # Get container changes (VkOptionsTemplate has a single virtual-kubelet container)
+    CONTAINER_CHANGES=$(echo "$VK_TEMPLATE_PLAN" | jq -r '.containerChanges // []')
+    CONTAINER_CHANGE=$(echo "$CONTAINER_CHANGES" | jq -r '.[0] // empty')
+    
+    if [ -n "$CONTAINER_CHANGE" ]; then
+      TARGET_IMAGE=$(echo "$CONTAINER_CHANGE" | jq -r '.targetImage')
+      FLAG_CHANGES=$(echo "$CONTAINER_CHANGE" | jq -r '.flagChanges // []')
+      
+      echo "  Target image: ${TARGET_IMAGE}"
+      
+      # Update image
+      kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+        --type='json' -p='[
+          {"op": "replace", "path": "/spec/containerImage", "value": "'"${TARGET_IMAGE}"'"}
+        ]' && echo "  ✓ Image updated" || echo "  ⚠️  Warning: Could not update image"
+      
+      # Apply extraArgs changes (VkOptionsTemplate uses spec.extraArgs instead of container args)
+      FLAG_COUNT=$(echo "$FLAG_CHANGES" | jq 'length')
+      if [ "$FLAG_COUNT" -gt 0 ]; then
+        echo "  Applying ${FLAG_COUNT} extraArgs change(s)..."
+        
+        # Get current extraArgs
+        CURRENT_ARGS=$(kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+          -o jsonpath='{.spec.extraArgs}' 2>/dev/null | jq -r '.' 2>/dev/null || echo "[]")
+        
+        if [ -z "$CURRENT_ARGS" ] || [ "$CURRENT_ARGS" == "null" ]; then
+          CURRENT_ARGS="[]"
+        fi
+        
+        NEW_ARGS="$CURRENT_ARGS"
+        while IFS= read -r change; do
+          TYPE=$(echo "$change" | jq -r '.type')
+          FLAG=$(echo "$change" | jq -r '.flag')
+          NEW_VALUE=$(echo "$change" | jq -r '.newValue // ""')
+          
+          if [ "$TYPE" == "add" ]; then
+            echo "    add: --${FLAG}=${NEW_VALUE}"
+            NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+          elif [ "$TYPE" == "update" ]; then
+            echo "    update: --${FLAG}=${NEW_VALUE}"
+            NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+            NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg f "--${FLAG}=${NEW_VALUE}" '. += [$f]')
+          elif [ "$TYPE" == "remove" ]; then
+            echo "    remove: --${FLAG}"
+            NEW_ARGS=$(echo "$NEW_ARGS" | jq --arg prefix "--${FLAG}" 'map(select(startswith($prefix) | not))')
+          fi
+        done < <(echo "$FLAG_CHANGES" | jq -c '.[]')
+        
+        # Apply extraArgs patch
+        kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+          --type='json' -p='[{"op": "replace", "path": "/spec/extraArgs", "value": '"${NEW_ARGS}"'}]' \
+          && echo "  ✓ extraArgs updated" || echo "  ⚠️  Warning: Could not update extraArgs"
+      else
+        echo "  No extraArgs changes needed"
+      fi
+    else
+      # No container changes in plan, use fallback
+      echo "  No container changes in plan, using fallback image upgrade"
+      kubectl patch vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+        --type='json' -p='[
+          {"op": "replace", "path": "/spec/containerImage", "value": "'"${IMAGE_REGISTRY}"'/virtual-kubelet:'"${TARGET_VERSION}"'"}
+        ]' && echo "  ✓ VkOptionsTemplate image updated" || echo "  ⚠️  Warning: Could not update VkOptionsTemplate"
+    fi
+  fi
+  
+  echo "  ✅ VkOptionsTemplate upgrade complete"
 else
   echo "  ℹ️  VkOptionsTemplate not found, skipping"
 fi
@@ -1611,7 +2016,10 @@ sleep 2
 echo "Verifying VkOptionsTemplate update..."
 VK_TEMPLATE_IMAGE=$(kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
   -o jsonpath='{.spec.containerImage}' 2>/dev/null || echo "not found")
+VK_TEMPLATE_ARGS=$(kubectl get vkoptionstemplate virtual-kubelet-default -n "${NAMESPACE}" \
+  -o jsonpath='{.spec.extraArgs}' 2>/dev/null || echo "[]")
 echo "  VkOptionsTemplate image: ${VK_TEMPLATE_IMAGE}"
+echo "  VkOptionsTemplate extraArgs: ${VK_TEMPLATE_ARGS}"
 
 if [[ "$VK_TEMPLATE_IMAGE" != *"${TARGET_VERSION}"* ]] && [[ "$VK_TEMPLATE_IMAGE" != "not found" ]]; then
   echo "⚠️ Warning: VkOptionsTemplate not updated to ${TARGET_VERSION}"
@@ -1938,10 +2346,15 @@ echo "  Checking fabric pods API connectivity..."
 FABRIC_PODS=$(kubectl get pods -n "${NAMESPACE}" -l app.kubernetes.io/name=fabric -o jsonpath='{.items[*].metadata.name}')
 if [ -n "$FABRIC_PODS" ]; then
   FABRIC_POD=$(echo "$FABRIC_PODS" | awk '{print $1}')
-  if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- wget -q -O- --timeout=5 https://kubernetes.default.svc >/dev/null 2>&1; then
-    echo "    ✓ Fabric pod can reach Kubernetes API"
+  # Check if wget or curl is available
+  if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c 'command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1' 2>/dev/null; then
+    if kubectl exec -n "${NAMESPACE}" "$FABRIC_POD" -- /bin/sh -c 'wget -q -O- --timeout=5 https://kubernetes.default.svc >/dev/null 2>&1 || curl -k -s --connect-timeout 5 https://kubernetes.default.svc >/dev/null 2>&1' 2>/dev/null; then
+      echo "    ✓ Fabric pod can reach Kubernetes API"
+    else
+      echo "    ⚠️  WARNING: Fabric pod cannot reach Kubernetes API"
+    fi
   else
-    echo "    ⚠️  WARNING: Fabric pod cannot reach Kubernetes API"
+    echo "    ℹ️  Skipping API check (wget/curl not in fabric image)"
   fi
 else
   echo "    ⚠️  WARNING: No fabric pods found"
@@ -2228,7 +2641,7 @@ echo "========================================="
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: int32Ptr(300),
+			TTLSecondsAfterFinished: int32Ptr(1800),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "liqo-upgrade-controller",

@@ -336,6 +336,14 @@ upgrade_component() {
     TARGET_IMAGE=$(echo "$COMPONENT_PLAN" | jq -r '.targetImage')
     CONTAINER_NAME=$(echo "$COMPONENT_PLAN" | jq -r '.containerName // .name')
 
+    # Verify container name exists in the deployment, fallback to actual if plan's name is wrong
+    ACTUAL_CONTAINER=$(kubectl get deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" \
+      -o jsonpath='{.spec.template.spec.containers[0].name}' 2>/dev/null)
+    if [ -n "$ACTUAL_CONTAINER" ] && [ "$CONTAINER_NAME" != "$ACTUAL_CONTAINER" ]; then
+      echo "  ⚠️  Plan container name '${CONTAINER_NAME}' not found, using actual: '${ACTUAL_CONTAINER}'"
+      CONTAINER_NAME="$ACTUAL_CONTAINER"
+    fi
+
     echo "  Target image: ${TARGET_IMAGE}"
     echo "  Container name: ${CONTAINER_NAME}"
 
@@ -345,6 +353,38 @@ upgrade_component() {
     kubectl set image deployment/"${COMPONENT_NAME}" \
       "${CONTAINER_NAME}"="${TARGET_IMAGE}" \
       -n "${NAMESPACE}"
+
+    # Apply command changes (if any)
+    TARGET_COMMAND=$(echo "$COMPONENT_PLAN" | jq -r '.targetCommand // []')
+    COMMAND_COUNT=$(echo "$TARGET_COMMAND" | jq 'length')
+
+    if [ "$COMMAND_COUNT" -gt 0 ]; then
+      echo ""
+      echo "Applying command change..."
+      echo "  Target command: $(echo "$TARGET_COMMAND" | jq -c '.')"
+
+      # Apply command patch
+      COMMAND_PATCH=$(cat <<EOF
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "${CONTAINER_NAME}",
+          "command": ${TARGET_COMMAND}
+        }]
+      }
+    }
+  }
+}
+EOF
+)
+      kubectl patch deployment "${COMPONENT_NAME}" -n "${NAMESPACE}" --type=strategic --patch "$COMMAND_PATCH"
+      echo "  ✓ Command updated"
+    else
+      echo ""
+      echo "No command changes needed"
+    fi
 
     # Apply environment variable changes
     ENV_CHANGES=$(echo "$COMPONENT_PLAN" | jq -r '.envChanges // []')
@@ -938,7 +978,7 @@ echo "  - Post-rollout health: verified"
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: int32Ptr(300),
+			TTLSecondsAfterFinished: int32Ptr(1800),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "liqo-upgrade-controller",

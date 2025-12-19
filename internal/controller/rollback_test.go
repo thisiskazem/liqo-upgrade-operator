@@ -127,8 +127,8 @@ func TestBuildRollbackJob(t *testing.T) {
 			}
 
 			// Verify TTL
-			if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 300 {
-				t.Error("Job should have TTLSecondsAfterFinished set to 300")
+			if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 1800 {
+				t.Error("Job should have TTLSecondsAfterFinished set to 1800")
 			}
 
 			// Verify BackoffLimit

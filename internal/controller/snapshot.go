@@ -27,6 +27,8 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -42,6 +44,7 @@ type ComponentSnapshot struct {
 	Namespace string                      `json:"namespace"`
 	Exists    bool                        `json:"exists"`
 	Image     string                      `json:"image,omitempty"`
+	Command   []string                    `json:"command,omitempty"`
 	Args      []string                    `json:"args,omitempty"`
 	Env       []corev1.EnvVar             `json:"env,omitempty"`
 	Labels    map[string]string           `json:"labels,omitempty"`
@@ -60,8 +63,27 @@ type CRDSnapshot struct {
 type ClusterSnapshot struct {
 	Components []ComponentSnapshot `json:"components"`
 	CRDs       []CRDSnapshot       `json:"crds"`
+	Templates  []TemplateSnapshot  `json:"templates,omitempty"`
 	Timestamp  metav1.Time         `json:"timestamp"`
 	Version    string              `json:"version"`
+}
+
+// TemplateSnapshot represents a snapshot of a template CRD (VkOptionsTemplate, WgGatewayClientTemplate, etc.)
+type TemplateSnapshot struct {
+	Name       string                      `json:"name"`
+	Kind       string                      `json:"kind"`
+	Namespace  string                      `json:"namespace"`
+	Exists     bool                        `json:"exists"`
+	Containers []TemplateContainerSnapshot `json:"containers,omitempty"`
+}
+
+// TemplateContainerSnapshot represents container configuration within a template
+type TemplateContainerSnapshot struct {
+	Name    string          `json:"name"`
+	Image   string          `json:"image,omitempty"`
+	Command []string        `json:"command,omitempty"`
+	Args    []string        `json:"args,omitempty"`
+	Env     []corev1.EnvVar `json:"env,omitempty"`
 }
 
 // TargetEnvVar represents an environment variable in the target descriptor
@@ -84,17 +106,40 @@ type TargetComponentDescriptor struct {
 		Repository string `json:"repository"`
 		Tag        string `json:"tag"`
 	} `json:"image"`
-	Args []string       `json:"args,omitempty"`
-	Env  []TargetEnvVar `json:"env,omitempty"`
+	Command []string       `json:"command,omitempty"`
+	Args    []string       `json:"args,omitempty"`
+	Env     []TargetEnvVar `json:"env,omitempty"`
+}
+
+// TargetTemplateContainerDescriptor describes a container within a template CRD
+type TargetTemplateContainerDescriptor struct {
+	Name  string `json:"name"`
+	Image struct {
+		Repository string `json:"repository"`
+		Tag        string `json:"tag"`
+	} `json:"image"`
+	Command []string       `json:"command,omitempty"`
+	Args    []string       `json:"args,omitempty"`
+	Env     []TargetEnvVar `json:"env,omitempty"`
+}
+
+// TargetTemplateDescriptor describes a template CRD in the target Liqo version
+type TargetTemplateDescriptor struct {
+	Name       string                              `json:"name"`
+	Kind       string                              `json:"kind"`
+	Namespace  string                              `json:"namespace"`
+	Containers []TargetTemplateContainerDescriptor `json:"containers,omitempty"`
 }
 
 // TargetDescriptor represents the expected state of a Liqo version
 type TargetDescriptor struct {
 	Version    string                      `json:"version"`
 	Components []TargetComponentDescriptor `json:"components"`
+	Templates  []TargetTemplateDescriptor  `json:"templates,omitempty"`
 }
 
-// Component definitions to inventory
+// Component definitions to inventory (core components with static deployments)
+// Note: liqo-gateway is NOT a direct Deployment - gateways are dynamically created from templates
 var liqoComponents = []struct {
 	Name      string
 	Kind      string
@@ -108,7 +153,17 @@ var liqoComponents = []struct {
 	{"liqo-telemetry", "CronJob", "liqo"},
 	{"liqo-metric-agent", "Deployment", "liqo"},
 	{"liqo-fabric", "DaemonSet", "liqo"},
-	{"liqo-gateway", "Deployment", "liqo"},
+}
+
+// Template CRDs to inventory (these define configurations for dynamically created components)
+var liqoTemplateCRDs = []struct {
+	Name      string
+	Kind      string
+	Namespace string
+}{
+	{"virtual-kubelet-default", "VkOptionsTemplate", "liqo"},
+	{"wireguard-client", "WgGatewayClientTemplate", "liqo"},
+	{"wireguard-server", "WgGatewayServerTemplate", "liqo"},
 }
 
 // createLiveInventory builds a full snapshot of the current Liqo installation
@@ -119,6 +174,7 @@ func (r *LiqoUpgradeReconciler) createLiveInventory(ctx context.Context, namespa
 	snapshot := &ClusterSnapshot{
 		Components: []ComponentSnapshot{},
 		CRDs:       []CRDSnapshot{},
+		Templates:  []TemplateSnapshot{},
 		Timestamp:  metav1.Now(),
 		Version:    currentVersion,
 	}
@@ -161,7 +217,10 @@ func (r *LiqoUpgradeReconciler) createLiveInventory(ctx context.Context, namespa
 		snapshot.CRDs = crdSnapshots
 	}
 
-	logger.Info("Live inventory complete", "components", len(snapshot.Components), "crds", len(snapshot.CRDs))
+	// 5. Inventory template CRDs (VkOptionsTemplate, WgGatewayClientTemplate, WgGatewayServerTemplate)
+	snapshot.Templates = r.inventoryTemplateCRDs(ctx, namespace)
+
+	logger.Info("Live inventory complete", "components", len(snapshot.Components), "crds", len(snapshot.CRDs), "templates", len(snapshot.Templates))
 	return snapshot
 }
 
@@ -225,6 +284,7 @@ func (r *LiqoUpgradeReconciler) inventoryComponent(ctx context.Context, name, ki
 	if podSpec != nil && len(podSpec.Containers) > 0 {
 		container := podSpec.Containers[0]
 		snapshot.Image = container.Image
+		snapshot.Command = container.Command
 		snapshot.Args = container.Args
 		snapshot.Env = container.Env
 		snapshot.Resources = container.Resources
@@ -259,6 +319,7 @@ func (r *LiqoUpgradeReconciler) inventoryVirtualKubelets(ctx context.Context, na
 			if len(ds.Spec.Template.Spec.Containers) > 0 {
 				container := ds.Spec.Template.Spec.Containers[0]
 				snapshot.Image = container.Image
+				snapshot.Command = container.Command
 				snapshot.Args = container.Args
 				snapshot.Env = container.Env
 				snapshot.Resources = container.Resources
@@ -302,6 +363,7 @@ func (r *LiqoUpgradeReconciler) inventoryTenantGateways(ctx context.Context) ([]
 				if len(deploy.Spec.Template.Spec.Containers) > 0 {
 					container := deploy.Spec.Template.Spec.Containers[0]
 					snapshot.Image = container.Image
+					snapshot.Command = container.Command
 					snapshot.Args = container.Args
 					snapshot.Env = container.Env
 					snapshot.Resources = container.Resources
@@ -346,6 +408,232 @@ func (r *LiqoUpgradeReconciler) inventoryCRDs(ctx context.Context) ([]CRDSnapsho
 	}
 
 	return snapshots, nil
+}
+
+// inventoryTemplateCRDs inventories template CRDs (VkOptionsTemplate, WgGatewayClientTemplate, WgGatewayServerTemplate)
+func (r *LiqoUpgradeReconciler) inventoryTemplateCRDs(ctx context.Context, namespace string) []TemplateSnapshot {
+	logger := log.FromContext(ctx)
+	var snapshots []TemplateSnapshot
+
+	for _, tmpl := range liqoTemplateCRDs {
+		ns := tmpl.Namespace
+		if ns == "" {
+			ns = namespace
+		}
+
+		var templateSnapshot *TemplateSnapshot
+		var err error
+
+		switch tmpl.Kind {
+		case "VkOptionsTemplate":
+			templateSnapshot, err = r.inventoryVkOptionsTemplate(ctx, tmpl.Name, ns)
+		case "WgGatewayClientTemplate":
+			templateSnapshot, err = r.inventoryWgGatewayTemplate(ctx, tmpl.Name, ns, "wggatewayclienttemplates")
+		case "WgGatewayServerTemplate":
+			templateSnapshot, err = r.inventoryWgGatewayTemplate(ctx, tmpl.Name, ns, "wggatewayservertemplates")
+		default:
+			logger.Info("Unknown template kind", "kind", tmpl.Kind)
+			continue
+		}
+
+		if err != nil {
+			logger.Info("Template not found or error", "name", tmpl.Name, "kind", tmpl.Kind, "error", err)
+			// Add snapshot indicating it doesn't exist
+			snapshots = append(snapshots, TemplateSnapshot{
+				Name:      tmpl.Name,
+				Kind:      tmpl.Kind,
+				Namespace: ns,
+				Exists:    false,
+			})
+		} else if templateSnapshot != nil {
+			snapshots = append(snapshots, *templateSnapshot)
+		}
+	}
+
+	return snapshots
+}
+
+// inventoryVkOptionsTemplate inventories a VkOptionsTemplate CRD
+func (r *LiqoUpgradeReconciler) inventoryVkOptionsTemplate(ctx context.Context, name, namespace string) (*TemplateSnapshot, error) {
+	// Use unstructured to fetch the VkOptionsTemplate
+	vkTemplate := &unstructured.Unstructured{}
+	vkTemplate.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "offloading.liqo.io",
+		Version: "v1beta1",
+		Kind:    "VkOptionsTemplate",
+	})
+
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, vkTemplate)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return &TemplateSnapshot{
+				Name:      name,
+				Kind:      "VkOptionsTemplate",
+				Namespace: namespace,
+				Exists:    false,
+			}, nil
+		}
+		return nil, err
+	}
+
+	snapshot := &TemplateSnapshot{
+		Name:       name,
+		Kind:       "VkOptionsTemplate",
+		Namespace:  namespace,
+		Exists:     true,
+		Containers: []TemplateContainerSnapshot{},
+	}
+
+	// Extract spec.containerImage
+	containerImage, found, _ := unstructured.NestedString(vkTemplate.Object, "spec", "containerImage")
+
+	// Extract spec.extraArgs
+	extraArgs, _, _ := unstructured.NestedStringSlice(vkTemplate.Object, "spec", "extraArgs")
+
+	if found || len(extraArgs) > 0 {
+		container := TemplateContainerSnapshot{
+			Name:  "virtual-kubelet",
+			Image: containerImage,
+			Args:  extraArgs,
+		}
+		snapshot.Containers = append(snapshot.Containers, container)
+	}
+
+	return snapshot, nil
+}
+
+// inventoryWgGatewayTemplate inventories a WgGatewayClientTemplate or WgGatewayServerTemplate CRD
+func (r *LiqoUpgradeReconciler) inventoryWgGatewayTemplate(ctx context.Context, name, namespace, resourcePlural string) (*TemplateSnapshot, error) {
+	// Use unstructured to fetch the template
+	gwTemplate := &unstructured.Unstructured{}
+
+	kind := "WgGatewayClientTemplate"
+	if resourcePlural == "wggatewayservertemplates" {
+		kind = "WgGatewayServerTemplate"
+	}
+
+	gwTemplate.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "networking.liqo.io",
+		Version: "v1beta1",
+		Kind:    kind,
+	})
+
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, gwTemplate)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return &TemplateSnapshot{
+				Name:      name,
+				Kind:      kind,
+				Namespace: namespace,
+				Exists:    false,
+			}, nil
+		}
+		return nil, err
+	}
+
+	snapshot := &TemplateSnapshot{
+		Name:       name,
+		Kind:       kind,
+		Namespace:  namespace,
+		Exists:     true,
+		Containers: []TemplateContainerSnapshot{},
+	}
+
+	// Navigate to spec.template.spec.deployment.spec.template.spec.containers
+	containers, found, err := unstructured.NestedSlice(gwTemplate.Object,
+		"spec", "template", "spec", "deployment", "spec", "template", "spec", "containers")
+	if err != nil || !found {
+		return snapshot, nil
+	}
+
+	for _, c := range containers {
+		containerMap, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		containerSnapshot := TemplateContainerSnapshot{}
+
+		// Extract name
+		if name, ok := containerMap["name"].(string); ok {
+			containerSnapshot.Name = name
+		}
+
+		// Extract image
+		if image, ok := containerMap["image"].(string); ok {
+			containerSnapshot.Image = image
+		}
+
+		// Extract command
+		if command, ok := containerMap["command"].([]interface{}); ok {
+			for _, cmd := range command {
+				if cmdStr, ok := cmd.(string); ok {
+					containerSnapshot.Command = append(containerSnapshot.Command, cmdStr)
+				}
+			}
+		}
+
+		// Extract args
+		if args, ok := containerMap["args"].([]interface{}); ok {
+			for _, arg := range args {
+				if argStr, ok := arg.(string); ok {
+					containerSnapshot.Args = append(containerSnapshot.Args, argStr)
+				}
+			}
+		}
+
+		// Extract env
+		if envList, ok := containerMap["env"].([]interface{}); ok {
+			for _, e := range envList {
+				envMap, ok := e.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				envVar := corev1.EnvVar{}
+				if name, ok := envMap["name"].(string); ok {
+					envVar.Name = name
+				}
+				if value, ok := envMap["value"].(string); ok {
+					envVar.Value = value
+				}
+				// Handle valueFrom if needed (configMapKeyRef, secretKeyRef, fieldRef)
+				if valueFrom, ok := envMap["valueFrom"].(map[string]interface{}); ok {
+					envVar.ValueFrom = &corev1.EnvVarSource{}
+					if fieldRef, ok := valueFrom["fieldRef"].(map[string]interface{}); ok {
+						envVar.ValueFrom.FieldRef = &corev1.ObjectFieldSelector{}
+						if fieldPath, ok := fieldRef["fieldPath"].(string); ok {
+							envVar.ValueFrom.FieldRef.FieldPath = fieldPath
+						}
+					}
+					if configMapRef, ok := valueFrom["configMapKeyRef"].(map[string]interface{}); ok {
+						envVar.ValueFrom.ConfigMapKeyRef = &corev1.ConfigMapKeySelector{}
+						if name, ok := configMapRef["name"].(string); ok {
+							envVar.ValueFrom.ConfigMapKeyRef.Name = name
+						}
+						if key, ok := configMapRef["key"].(string); ok {
+							envVar.ValueFrom.ConfigMapKeyRef.Key = key
+						}
+					}
+					if secretRef, ok := valueFrom["secretKeyRef"].(map[string]interface{}); ok {
+						envVar.ValueFrom.SecretKeyRef = &corev1.SecretKeySelector{}
+						if name, ok := secretRef["name"].(string); ok {
+							envVar.ValueFrom.SecretKeyRef.Name = name
+						}
+						if key, ok := secretRef["key"].(string); ok {
+							envVar.ValueFrom.SecretKeyRef.Key = key
+						}
+					}
+				}
+
+				containerSnapshot.Env = append(containerSnapshot.Env, envVar)
+			}
+		}
+
+		snapshot.Containers = append(snapshot.Containers, containerSnapshot)
+	}
+
+	return snapshot, nil
 }
 
 // createSnapshotConfigMap creates a ConfigMap with the full snapshot

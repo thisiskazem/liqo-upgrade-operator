@@ -182,7 +182,7 @@ func (r *LiqoUpgradeReconciler) waitForGeneratorJob(ctx context.Context, jobName
 // buildTargetDescriptorGeneratorJob creates the Job that generates target descriptors using Helm
 func (r *LiqoUpgradeReconciler) buildTargetDescriptorGeneratorJob(upgrade *upgradev1alpha1.LiqoUpgrade, version, namespace, jobName string) *batchv1.Job {
 	backoffLimit := int32(3)
-	ttlSeconds := int32(300) // Clean up after 5 minutes (same as other upgrade jobs)
+	ttlSeconds := int32(1800) // Clean up after 30 minutes (same as other upgrade jobs)
 
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
@@ -247,7 +247,7 @@ helm template liqo ./deployments/liqo \
   --set authentication.enabled=true \
   --set offloading.enabled=true \
   --set storage.enabled=false \
-  --set proxy.enabled=false \
+  --set proxy.enabled=true \
   > "${WORK_DIR}/rendered.yaml" 2>/dev/null || {
     # Try with minimal values if default fails
     helm template liqo ./deployments/liqo \
@@ -279,18 +279,27 @@ with open(input_file, 'r') as f:
 docs = list(yaml.safe_load_all(content))
 
 components = []
+templates = []
 
-# Component mapping
+# Component mapping (core components with static deployments)
+# Note: liqo-gateway is NOT a direct Deployment - gateways are dynamically created from templates
+# Container names match the Helm template $config.name values (not the resource names with liqo- prefix)
 component_info = {
     'liqo-controller-manager': {'kind': 'Deployment', 'containerName': 'controller-manager'},
     'liqo-crd-replicator': {'kind': 'Deployment', 'containerName': 'crd-replicator'},
     'liqo-webhook': {'kind': 'Deployment', 'containerName': 'webhook'},
     'liqo-ipam': {'kind': 'Deployment', 'containerName': 'ipam'},
-    'liqo-proxy': {'kind': 'Deployment', 'containerName': 'liqo-proxy'},
-    'liqo-fabric': {'kind': 'DaemonSet', 'containerName': 'liqo-fabric'},
-    'liqo-gateway': {'kind': 'Deployment', 'containerName': 'gateway'},
+    'liqo-proxy': {'kind': 'Deployment', 'containerName': 'proxy'},
+    'liqo-fabric': {'kind': 'DaemonSet', 'containerName': 'fabric'},
     'liqo-metric-agent': {'kind': 'Deployment', 'containerName': 'metric-agent'},
     'liqo-telemetry': {'kind': 'CronJob', 'containerName': 'telemetry'},
+}
+
+# Template CRD mapping
+template_info = {
+    'VkOptionsTemplate': ['virtual-kubelet-default'],
+    'WgGatewayClientTemplate': ['wireguard-client'],
+    'WgGatewayServerTemplate': ['wireguard-server'],
 }
 
 def parse_env(env_list):
@@ -330,6 +339,71 @@ def parse_env(env_list):
             })
     return result
 
+def parse_image(image_str, default_tag):
+    """Parse image string into repository and tag"""
+    if ':' in image_str:
+        repo, tag = image_str.rsplit(':', 1)
+    else:
+        repo, tag = image_str, default_tag
+    return {'repository': repo, 'tag': tag}
+
+def parse_vkoptions_template(doc):
+    """Parse VkOptionsTemplate CRD"""
+    name = doc.get('metadata', {}).get('name', '')
+    spec = doc.get('spec', {})
+    
+    container_image = spec.get('containerImage', '')
+    extra_args = spec.get('extraArgs', [])
+    # VkOptionsTemplate doesn't have a command field - VK uses default entrypoint
+    
+    container = {
+        'name': 'virtual-kubelet',
+        'image': parse_image(container_image, version),
+        'command': [],  # VK uses image entrypoint
+        'args': extra_args if extra_args else [],
+        'env': []
+    }
+    
+    return {
+        'name': name,
+        'kind': 'VkOptionsTemplate',
+        'namespace': 'liqo',
+        'containers': [container]
+    }
+
+def parse_wg_gateway_template(doc, kind):
+    """Parse WgGatewayClientTemplate or WgGatewayServerTemplate CRD"""
+    name = doc.get('metadata', {}).get('name', '')
+    
+    # Navigate to spec.template.spec.deployment.spec.template.spec.containers
+    try:
+        containers_list = doc.get('spec', {}).get('template', {}).get('spec', {}).get('deployment', {}).get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
+    except:
+        containers_list = []
+    
+    parsed_containers = []
+    for c in containers_list:
+        container_name = c.get('name', '')
+        image = c.get('image', '')
+        command = c.get('command', [])
+        args = c.get('args', [])
+        env = parse_env(c.get('env', []))
+        
+        parsed_containers.append({
+            'name': container_name,
+            'image': parse_image(image, version),
+            'command': command if command else [],
+            'args': args if args else [],
+            'env': env if env else []
+        })
+    
+    return {
+        'name': name,
+        'kind': kind,
+        'namespace': 'liqo',
+        'containers': parsed_containers
+    }
+
 for doc in docs:
     if not doc:
         continue
@@ -337,65 +411,77 @@ for doc in docs:
     kind = doc.get('kind', '')
     name = doc.get('metadata', {}).get('name', '')
     
-    if name not in component_info:
+    # Parse core components
+    if name in component_info:
+        info = component_info[name]
+        if kind != info['kind']:
+            continue
+        
+        # Get container spec
+        if kind == 'CronJob':
+            containers = doc.get('spec', {}).get('jobTemplate', {}).get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
+        else:
+            containers = doc.get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
+        
+        if not containers:
+            continue
+        
+        # Find the right container
+        container = None
+        for c in containers:
+            if c.get('name') == info['containerName']:
+                container = c
+                break
+        
+        if not container:
+            container = containers[0]
+        
+        image = container.get('image', '')
+        command = container.get('command', [])
+        args = container.get('args', [])
+        env = parse_env(container.get('env', []))
+        
+        comp = {
+            'name': name,
+            'kind': kind,
+            'namespace': 'liqo',
+            'containerName': info['containerName'],
+            'image': parse_image(image, version),
+            'command': command if command else [],
+            'args': args if args else [],
+            'env': env if env else []
+        }
+        
+        components.append(comp)
         continue
     
-    info = component_info[name]
-    if kind != info['kind']:
-        continue
-    
-    # Get container spec
-    if kind == 'CronJob':
-        containers = doc.get('spec', {}).get('jobTemplate', {}).get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
-    else:
-        containers = doc.get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
-    
-    if not containers:
-        continue
-    
-    # Find the right container
-    container = None
-    for c in containers:
-        if c.get('name') == info['containerName']:
-            container = c
-            break
-    
-    if not container:
-        container = containers[0]
-    
-    image = container.get('image', '')
-    # Parse image into repository and tag
-    if ':' in image:
-        repo, tag = image.rsplit(':', 1)
-    else:
-        repo, tag = image, version
-    
-    args = container.get('args', [])
-    env = parse_env(container.get('env', []))
-    
-    comp = {
-        'name': name,
-        'kind': kind,
-        'namespace': 'liqo',
-        'containerName': info['containerName'],
-        'image': {
-            'repository': repo,
-            'tag': tag
-        },
-        'args': args if args else [],
-        'env': env if env else []
-    }
-    
-    components.append(comp)
+    # Parse template CRDs
+    if kind == 'VkOptionsTemplate':
+        expected_names = template_info.get('VkOptionsTemplate', [])
+        if name in expected_names:
+            templates.append(parse_vkoptions_template(doc))
+    elif kind == 'WgGatewayClientTemplate':
+        expected_names = template_info.get('WgGatewayClientTemplate', [])
+        if name in expected_names:
+            templates.append(parse_wg_gateway_template(doc, kind))
+    elif kind == 'WgGatewayServerTemplate':
+        expected_names = template_info.get('WgGatewayServerTemplate', [])
+        if name in expected_names:
+            templates.append(parse_wg_gateway_template(doc, kind))
 
 # Sort components in a logical order
 order = ['liqo-controller-manager', 'liqo-crd-replicator', 'liqo-webhook', 'liqo-ipam', 
-         'liqo-proxy', 'liqo-fabric', 'liqo-gateway', 'liqo-metric-agent', 'liqo-telemetry']
+         'liqo-proxy', 'liqo-fabric', 'liqo-metric-agent', 'liqo-telemetry']
 components.sort(key=lambda x: order.index(x['name']) if x['name'] in order else 999)
+
+# Sort templates
+template_order = ['virtual-kubelet-default', 'wireguard-client', 'wireguard-server']
+templates.sort(key=lambda x: template_order.index(x['name']) if x['name'] in template_order else 999)
 
 result = {
     'version': version,
-    'components': components
+    'components': components,
+    'templates': templates
 }
 
 # Output formatted JSON
@@ -415,7 +501,9 @@ if ! jq . "${WORK_DIR}/descriptor.json" > /dev/null 2>&1; then
 fi
 
 COMPONENT_COUNT=$(jq '.components | length' "${WORK_DIR}/descriptor.json")
+TEMPLATE_COUNT=$(jq '.templates | length' "${WORK_DIR}/descriptor.json")
 echo "  Components found: ${COMPONENT_COUNT}"
+echo "  Templates found: ${TEMPLATE_COUNT}"
 
 if [ "${COMPONENT_COUNT}" -lt 3 ]; then
   echo "❌ ERROR: Too few components found (expected at least 3)"
