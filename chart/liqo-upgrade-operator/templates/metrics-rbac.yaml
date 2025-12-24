@@ -1,0 +1,53 @@
+{{- if .Values.metrics.enabled }}
+---
+# ClusterRole for metrics authentication
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-metrics-auth-role
+  labels:
+    {{- include "liqo-upgrade-operator.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+# ClusterRoleBinding for metrics authentication
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-metrics-auth-rolebinding
+  labels:
+    {{- include "liqo-upgrade-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: {{ include "liqo-upgrade-operator.serviceAccountName" . }}
+  namespace: {{ .Values.namespace }}
+---
+# ClusterRole for metrics reader
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-metrics-reader
+  labels:
+    {{- include "liqo-upgrade-operator.labels" . | nindent 4 }}
+rules:
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get
+{{- end }}
+

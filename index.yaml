@@ -1,0 +1,21 @@
+apiVersion: v1
+entries:
+  liqo-upgrade-operator:
+  - apiVersion: v2
+    appVersion: "0.1"
+    created: "2025-12-24T10:33:25.472433406Z"
+    description: Kubernetes operator for managing Liqo version upgrades
+    digest: 268ee1b84662f0a7c83009cda30d4f5c83b2bb07bc12759e4cb7d5ac9217df19
+    keywords:
+    - liqo
+    - upgrade
+    - operator
+    - kubernetes
+    maintainers:
+    - name: Kazem
+    name: liqo-upgrade-operator
+    type: application
+    urls:
+    - https://thisiskazem.github.io/liqo-upgrade-operator/liqo-upgrade-operator-0.1.0.tgz
+    version: 0.1.0
+generated: "2025-12-24T10:33:25.467068857Z"

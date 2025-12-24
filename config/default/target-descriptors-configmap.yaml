@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: liqo-target-descriptors
+  namespace: liqo
+  labels:
+    app.kubernetes.io/name: liqo-upgrade
+    app.kubernetes.io/component: target-descriptor
+data: {}
+# Target descriptors are dynamically generated from Liqo Helm charts
+# during the validation phase (Step 5.5) based on:
+#   - Current version (detected from liqo-controller-manager image tag)
+#   - Target version (from LiqoUpgrade.spec.targetVersion)
+#
+# The generator Job fetches the Liqo Helm chart for each version,
+# renders it with `helm template`, and parses the output to create
+# accurate component descriptors with correct args and env vars.
