@@ -1,9 +1,0 @@
-apiVersion: upgrade.liqo.io/v1alpha1
-kind: LiqoUpgrade
-metadata:
-  labels:
-    app.kubernetes.io/name: liqo-upgrade-controller
-    app.kubernetes.io/managed-by: kustomize
-  name: liqoupgrade-sample
-spec:
-  # TODO(user): Add fields here
