@@ -1,0 +1,18 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-metrics-service
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "liqo-upgrade-operator.labels" . | nindent 4 }}
+spec:
+  ports:
+  - name: https
+    port: {{ .Values.metrics.port }}
+    protocol: TCP
+    targetPort: {{ .Values.metrics.port }}
+  selector:
+    {{- include "liqo-upgrade-operator.selectorLabels" . | nindent 4 }}
+{{- end }}
+

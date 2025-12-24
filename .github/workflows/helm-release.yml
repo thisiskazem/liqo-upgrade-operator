@@ -1,0 +1,37 @@
+name: Release Helm Chart
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+
+      - name: Package Helm Chart
+        run: |
+          mkdir -p .helm-repo
+          helm package chart/liqo-upgrade-operator -d .helm-repo
+          helm repo index .helm-repo --url https://thisiskazem.github.io/liqo-upgrade-operator
+
+          # Artifact Hub verification file
+          cat > .helm-repo/artifacthub-repo.yml << 'EOF'
+          repositoryID: fca96d62-16b9-4da8-8899-5f4411b3835b
+          owners:
+            - name: thisiskazem
+              email: kazembigdeliapply@gmail.com
+          EOF
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./.helm-repo

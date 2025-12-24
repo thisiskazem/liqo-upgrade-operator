@@ -1,0 +1,61 @@
+# Liqo Upgrade Operator Helm Values
+
+# Operator image configuration
+image:
+  repository: kazem26/liqo-upgrade-operator
+  tag: v0.1
+  pullPolicy: IfNotPresent
+
+# Namespace where the operator will be deployed
+namespace: liqo-upgrade-controller-system
+
+# Namespace where Liqo is installed (for ConfigMaps and upgrade ServiceAccount)
+liqoNamespace: liqo
+
+# Resource limits and requests for the operator
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+# Leader election settings
+leaderElection:
+  enabled: true
+
+# Metrics configuration
+metrics:
+  enabled: true
+  port: 8443
+
+# Health probe settings
+healthProbe:
+  port: 8081
+
+# Security context for the pod
+podSecurityContext:
+  runAsNonRoot: true
+
+# Security context for the container
+containerSecurityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Version compatibility matrix
+# Format: sourceVersion: [list of compatible targetVersions]
+compatibility:
+  v1.0.0:
+    - v1.0.1
+    - v1.0.2
+    - v1.0.3
+  v1.0.1:
+    - v1.0.2
+    - v1.0.3
+  v1.0.2:
+    - v1.0.3
+

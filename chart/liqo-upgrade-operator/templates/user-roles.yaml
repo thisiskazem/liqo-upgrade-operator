@@ -1,0 +1,81 @@
+---
+# Admin role for LiqoUpgrade resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-liqoupgrade-admin-role
+  labels:
+    {{- include "liqo-upgrade-operator.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+- apiGroups:
+  - upgrade.liqo.io
+  resources:
+  - liqoupgrades
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - upgrade.liqo.io
+  resources:
+  - liqoupgrades/status
+  verbs:
+  - get
+---
+# Editor role for LiqoUpgrade resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-liqoupgrade-editor-role
+  labels:
+    {{- include "liqo-upgrade-operator.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+- apiGroups:
+  - upgrade.liqo.io
+  resources:
+  - liqoupgrades
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - upgrade.liqo.io
+  resources:
+  - liqoupgrades/status
+  verbs:
+  - get
+---
+# Viewer role for LiqoUpgrade resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "liqo-upgrade-operator.fullname" . }}-liqoupgrade-viewer-role
+  labels:
+    {{- include "liqo-upgrade-operator.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+- apiGroups:
+  - upgrade.liqo.io
+  resources:
+  - liqoupgrades
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - upgrade.liqo.io
+  resources:
+  - liqoupgrades/status
+  verbs:
+  - get
+
