@@ -4,7 +4,7 @@ metadata:
   name: liqo-upgrade-test
   namespace: liqo
 spec:
-  targetVersion: v1.0.1
+  targetVersion: v1.0.1   # <--- specify the desired Liqo version here
   namespace: liqo
 #  dryRun: true
 #  imageRegistry: "my-private-registry.com/liqo"
