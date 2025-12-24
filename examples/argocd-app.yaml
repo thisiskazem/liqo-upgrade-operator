@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: liqo-upgrade-operator
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://thisiskazem.github.io/liqo-upgrade-operator
+    chart: liqo-upgrade-operator
+    targetRevision: 0.1.0  # or "*" for latest
+    helm:
+      values: |
+        # Override values here if needed
+        # image:
+        #   tag: latest
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: liqo
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
