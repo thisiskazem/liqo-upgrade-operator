@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	upgradev1alpha1 "github.com/thisiskazem/liqo-upgrade-controller/api/v1alpha1"
@@ -117,12 +118,11 @@ func (r *LiqoUpgradeReconciler) generateAndStoreTargetDescriptor(ctx context.Con
 			return nil
 		}
 		if existingJob.Status.Failed > 0 {
-			// Delete failed job and retry
-			logger.Info("Deleting failed target descriptor generator job", "version", version)
+			logger.Info("Deleting failed target descriptor generator job, will retry on next reconcile", "version", version)
 			if err := r.Delete(ctx, existingJob); err != nil {
 				return fmt.Errorf("failed to delete failed job: %w", err)
 			}
-			time.Sleep(2 * time.Second)
+			return ErrRequeueNeeded
 		} else {
 			// Job still running, wait
 			logger.Info("Target descriptor generator job still running, waiting...", "version", version)
@@ -130,8 +130,11 @@ func (r *LiqoUpgradeReconciler) generateAndStoreTargetDescriptor(ctx context.Con
 		}
 	}
 
-	// Create the generator job
+	// Create the generator job with owner reference so Owns watch triggers reconciliation
 	job := r.buildTargetDescriptorGeneratorJob(upgrade, version, namespace, jobName)
+	if err := controllerutil.SetControllerReference(upgrade, job, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set owner reference on generator job: %w", err)
+	}
 	if err := r.Create(ctx, job); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			return fmt.Errorf("failed to create generator job: %w", err)
