@@ -34,6 +34,10 @@ import (
 	upgradev1alpha1 "github.com/thisiskazem/liqo-upgrade-controller/api/v1alpha1"
 )
 
+// ErrRequeueNeeded is returned when a reconciliation should exit and wait for
+// an event-driven re-trigger (e.g., via Owns watch) instead of blocking with sleep.
+var ErrRequeueNeeded = fmt.Errorf("requeue needed: waiting for event-driven re-trigger")
+
 // updateStatus updates the LiqoUpgrade status with the given phase and message
 // Uses retry logic to handle optimistic concurrency conflicts
 func (r *LiqoUpgradeReconciler) updateStatus(ctx context.Context, upgrade *upgradev1alpha1.LiqoUpgrade, phase upgradev1alpha1.UpgradePhase, message string, additionalUpdates map[string]interface{}) (ctrl.Result, error) {

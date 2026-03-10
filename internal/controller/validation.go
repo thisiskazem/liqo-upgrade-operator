@@ -18,9 +18,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -108,6 +108,10 @@ func (r *LiqoUpgradeReconciler) performValidation(ctx context.Context, upgrade *
 	// This dynamically generates descriptors from Helm charts if they don't exist
 	logger.Info("Step 5.5: Ensuring target descriptors are generated")
 	if err := r.ensureTargetDescriptors(ctx, upgrade, localVersion, upgrade.Spec.TargetVersion, namespace); err != nil {
+		if errors.Is(err, ErrRequeueNeeded) {
+			logger.Info("Waiting for Job event to re-trigger reconciliation")
+			return ctrl.Result{}, nil
+		}
 		return r.fail(ctx, upgrade, fmt.Sprintf("Failed to ensure target descriptors: %v", err))
 	}
 	logger.Info("Target descriptors ensured for both versions", "currentVersion", localVersion, "targetVersion", upgrade.Spec.TargetVersion)
@@ -285,22 +289,6 @@ func (r *LiqoUpgradeReconciler) ensureClusterIDConfigMap(ctx context.Context, na
 	}
 
 	logger.Info("Created liqo-cluster-id ConfigMap", "clusterID", clusterID)
-
-	// Wait for ConfigMap to propagate to kubelet caches
-	// This prevents timing issues where pods start before the ConfigMap is available
-	logger.Info("Waiting for ConfigMap propagation...")
-	time.Sleep(5 * time.Second)
-
-	// Verify the ConfigMap is accessible
-	verifyConfigMap := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      "liqo-cluster-id",
-		Namespace: namespace,
-	}, verifyConfigMap); err != nil {
-		return fmt.Errorf("failed to verify liqo-cluster-id ConfigMap after creation: %w", err)
-	}
-
-	logger.Info("ConfigMap verified and ready", "clusterID", verifyConfigMap.Data["CLUSTER_ID"])
 	return nil
 }
 
