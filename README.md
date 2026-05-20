@@ -251,3 +251,4 @@ This project is licensed under the Apache 2.0 License.
 - **Helm Repository**: [thisiskazem.github.io/liqo-upgrade-operator](https://thisiskazem.github.io/liqo-upgrade-operator)
 - **Artifact Hub**: [artifacthub.io/packages/helm/liqo-upgrade-operator](https://artifacthub.io/packages/helm/liqo-upgrade-operator/liqo-upgrade-operator)
 - **Liqo Project**: [liqo.io](https://liqo.io)
+
