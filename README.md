@@ -59,7 +59,7 @@ helm install liqo-upgrade-operator liqo-upgrade/liqo-upgrade-operator \
 #### Verify installation
 
 ```
-kubectl get pods -n liqo -l app.kubernetes.io/name=liqo-upgrade-operator
+kubectl get pods -n liqo-upgrade-controller-system -l app.kubernetes.io/name=liqo-upgrade-operator
 ```
 
 ### Option 3: Helm (Local Clone)
